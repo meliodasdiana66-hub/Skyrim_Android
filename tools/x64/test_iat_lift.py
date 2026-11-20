@@ -70,6 +70,24 @@ def _plant(buf, slots):
 
 
 class IatLiftTests(unittest.TestCase):
+    def test_overlap_and_image_bounds_fail_closed(self):
+        self.assertIsNone(cfg_sandbox.iat_slot_fault(0x2FF8, 0x3000))
+        self.assertEqual(cfg_sandbox.iat_slot_fault(0x3000, 0x3000), "iat_oob")
+        self.assertEqual(cfg_sandbox.iat_slot_fault(0x2FFC, 0x3000), "iat_cross_page")
+        code = bytes.fromhex("90c3")
+        with self.assertRaises(cfg_sandbox.CfgError) as caught:
+            cfg_sandbox.execute_iat({cfg_sandbox.STACK_LO: code}, cfg_sandbox.STACK_LO, _cpu(), _mem(), DONE, {}, LAST, PID)
+        self.assertEqual(caught.exception.reason, "range_overlap")
+        slots = {0xE000: {"id": 2, "name": "GetLastError", "modeled": True}}
+        with self.assertRaises(cfg_sandbox.CfgError) as caught:
+            cfg_sandbox.execute_iat({ENTRY: code}, ENTRY, _cpu(), _mem(), DONE, slots, LAST, PID)
+        self.assertEqual(caught.exception.reason, "range_overlap")
+        covering = b"\x90" * 0x20 + b"\xc3"
+        slots = {0x2100: {"id": 2, "name": "GetLastError", "modeled": True}}
+        with self.assertRaises(cfg_sandbox.CfgError) as caught:
+            cfg_sandbox.execute_iat({0x20E8: covering}, 0x20E8, _cpu(), _mem(), DONE, slots, LAST, PID)
+        self.assertEqual(caught.exception.reason, "range_overlap")
+
     def test_image_rva_is_not_a_snippet_window_fault(self):
         real = 24441520
         self.assertIsNone(cfg_sandbox.iat_slot_fault(real, 59179008))
@@ -250,6 +268,79 @@ class IatLiftTests(unittest.TestCase):
             self.assertEqual(found["obstacles"].get("iat_unmodeled"), 1)
             text = json.dumps(found)
             self.assertNotRegex(text, r"\"[0-9a-fA-F]{16,}\"")
+
+
+class DiagnosticDetailTests(unittest.TestCase):
+    def test_modeled_candidates_keep_every_reason_and_no_bytes(self):
+        iat = 0x2100
+        direct = 0x1100
+        data_rva = 0x3000
+        first = bytes.fromhex("4883ec28")
+        first += b"\xff\x15" + struct.pack("<i", iat - (0x1000 + len(first) + 6))
+        call_at = 0x1000 + len(first)
+        first += b"\xe8" + struct.pack("<i", direct - (call_at + 5))
+        first += bytes.fromhex("4883c428c3")
+        helper = bytes.fromhex("90c3")
+        second = bytes.fromhex("4883ec28")
+        second += b"\xff\x15" + struct.pack("<i", iat - (0x1200 + len(second) + 6))
+        mov_at = 0x1200 + len(second)
+        second += b"\x48\x8b\x05" + struct.pack("<i", data_rva - (mov_at + 7))
+        second += bytes.fromhex("4883c428c3")
+        blob = bytearray(0xC00)
+        blob[0:2] = b"MZ"
+        struct.pack_into("<I", blob, 0x3C, 0x80)
+        blob[0x80:0x84] = b"PE\0\0"
+        struct.pack_into("<HH", blob, 0x84, 0x8664, 4)
+        struct.pack_into("<H", blob, 0x94, 0xF0)
+        struct.pack_into("<H", blob, 0x98, 0x20B)
+        struct.pack_into("<I", blob, 0x98 + 16, 0x1F00)
+        struct.pack_into("<Q", blob, 0x98 + 24, 0x140000000)
+        struct.pack_into("<I", blob, 0x98 + 56, 0x5000)
+        struct.pack_into("<I", blob, 0x98 + 108, 16)
+        struct.pack_into("<II", blob, 0x98 + 120, 0x2000, 40)
+        struct.pack_into("<II", blob, 0x98 + 136, 0x4000, 36)
+        blob[0x188:0x18D] = b".text"
+        struct.pack_into("<IIIIII", blob, 0x188 + 8, 0x1000, 0x1000, 0x400, 0x400, 0, 0)
+        struct.pack_into("<I", blob, 0x188 + 36, 0x60000020)
+        blob[0x1B0:0x1B5] = b".data"
+        struct.pack_into("<IIIIII", blob, 0x1B0 + 8, 0x200, 0x2000, 0x200, 0x800, 0, 0)
+        struct.pack_into("<I", blob, 0x1B0 + 36, 0xC0000040)
+        blob[0x1D8:0x1DE] = b".rdata"
+        struct.pack_into("<IIIIII", blob, 0x1D8 + 8, 0x100, 0x3000, 0x100, 0xA00, 0, 0)
+        struct.pack_into("<I", blob, 0x1D8 + 36, 0x40000040)
+        blob[0x200:0x206] = b".pdata"
+        struct.pack_into("<IIIIII", blob, 0x208, 0x100, 0x4000, 0x100, 0xB00, 0, 0)
+        struct.pack_into("<I", blob, 0x224, 0x40000040)
+        blob[0x400:0x400 + len(first)] = first
+        blob[0x500:0x502] = helper
+        blob[0x600:0x600 + len(second)] = second
+        struct.pack_into("<IIIII", blob, 0x800, 0x2040, 0, 0, 0x2080, 0x2100)
+        struct.pack_into("<Q", blob, 0x840, 0x2120)
+        blob[0x880:0x88D] = b"KERNEL32.dll"
+        blob[0x922:0x922 + 13] = b"GetLastError"
+        struct.pack_into("<III", blob, 0xB00, 0x1000, 0x1000 + len(first), 0)
+        struct.pack_into("<III", blob, 0xB0C, 0x1100, 0x1102, 0)
+        struct.pack_into("<III", blob, 0xB18, 0x1200, 0x1200 + len(second), 0)
+        found = cfg_sandbox.discover_modeled_iat(bytes(blob))
+        self.assertEqual(found["eligible"], 0)
+        self.assertFalse(found["executed"])
+        by_rva = {row["rva"]: row for row in found["modeledCandidates"]}
+        self.assertEqual(sorted(by_rva), [0x1000, 0x1200])
+        self.assertIn("direct_call", by_rva[0x1000]["reasons"])
+        self.assertEqual(by_rva[0x1000]["directCallTargets"], [0x1100])
+        self.assertEqual(by_rva[0x1000]["imports"][0]["name"], "GetLastError")
+        self.assertTrue(by_rva[0x1000]["imports"][0]["modeled"])
+        self.assertEqual(by_rva[0x1200]["reasons"], ["memory_or_global"])
+        access = by_rva[0x1200]["memory"][0]
+        self.assertEqual(access["kind"], "rip")
+        self.assertEqual(access["access"], "load")
+        self.assertEqual(access["width"], 8)
+        self.assertEqual(access["target"], 0x3000)
+        self.assertEqual(access["section"], ".rdata")
+        self.assertFalse(access["writable"])
+        text = json.dumps(found)
+        self.assertNotIn("4883ec28", text)
+        self.assertNotIn("8b05", text.lower())
 
 
 class HighIatDiscoveryTests(unittest.TestCase):

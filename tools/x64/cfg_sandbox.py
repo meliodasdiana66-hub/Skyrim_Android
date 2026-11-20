@@ -554,6 +554,16 @@ def execute_iat(funcs, entry, cpu, mem, return_ip, iat_slots, last_addr, pid,
     _check_stack(cpu, mem, return_ip)
     image = bytearray(mem)
     external = {}
+    stack = (STACK_LO, STACK_TOP + 8)
+    for base, code in funcs.items():
+        if _span_overlap(base, base + len(code), stack[0], stack[1]):
+            raise CfgError("range_overlap")
+        for addr in iat_slots:
+            if _span_overlap(base, base + len(code), addr, addr + 8):
+                raise CfgError("range_overlap")
+    for addr in iat_slots:
+        if _span_overlap(addr, addr + 8, stack[0], stack[1]):
+            raise CfgError("range_overlap")
     for base, code in funcs.items():
         if base < MEMSZ < base + len(code) or (base & ~0xFFF) != ((base + len(code) - 1) & ~0xFFF):
             raise CfgError("span_limit")
@@ -1532,15 +1542,69 @@ def _import_slots(data, info):
                 break
             ordinal = bool(value & 0x8000000000000000)
             name = None if ordinal else _slot_name(data, sections, value)
+            ordinal_value = (value & 0xFFFF) if ordinal else None
             modeled = (not ordinal and dll.lower() == "kernel32.dll" and
                        name in ("GetLastError", "GetCurrentProcessId"))
             slots[iat_rva + step * 8] = {
-                "dll": dll, "name": name, "ordinal": ordinal, "modeled": modeled,
+                "dll": dll, "name": name, "ordinal": ordinal, "ordinalValue": ordinal_value,
+                "modeled": modeled,
                 "id": (dll_index << 16) | step,
             }
             step += 1
         index += 1
     return slots
+
+
+def _span_overlap(a0, a1, b0, b1):
+    return a0 < b1 and b0 < a1
+
+
+def _memory_meta(insn, sections, image_size):
+    """Access facts only. Width is not an object size and no bytes are copied."""
+    if insn.get("rip"):
+        target, nbytes = insn["rip"]
+        access = "load" if insn.get("writes") else "store"
+        sec = _section_at(sections, target)
+        return {
+            "at": insn["address"],
+            "mnemonic": insn["mnemonic"],
+            "kind": "rip",
+            "access": access,
+            "width": nbytes,
+            "target": target,
+            "inImage": isinstance(target, int) and 0 <= target and target + nbytes <= image_size,
+            "section": None if sec is None else sec["name"],
+            "writable": None if sec is None else bool(sec["writable"]),
+            "executable": None if sec is None else bool(sec["executable"]),
+        }
+    mem = insn.get("mem")
+    if mem is None:
+        return {
+            "at": insn["address"],
+            "mnemonic": insn["mnemonic"],
+            "kind": "other",
+            "access": "access",
+            "width": None,
+        }
+    if mem[0] == "rsp":
+        return {
+            "at": insn["address"],
+            "mnemonic": insn["mnemonic"],
+            "kind": "rsp",
+            "access": mem[3],
+            "width": mem[2],
+            "disp": mem[1],
+        }
+    return {
+        "at": insn["address"],
+        "mnemonic": insn["mnemonic"],
+        "kind": "base",
+        "access": mem[4],
+        "width": mem[3],
+        "register": NAMES[mem[1]] if mem[1] < len(NAMES) else None,
+        "disp": mem[2],
+        "untracked": True,
+    }
 
 
 def discover_modeled_iat(data):
@@ -1560,7 +1624,9 @@ def discover_modeled_iat(data):
         "ordinalSlots": sum(1 for slot in slots.values() if slot["ordinal"]),
         "imageSize": info["sizeOfImage"],
         "callRip": 0,
+        "modeledCandidates": [],
     }
+    membership = Counter()
     image_size = info["sizeOfImage"]
     if not isinstance(image_size, int) or image_size <= 0 or image_size > MAX_GUEST:
         report["obstacles"] = {"image_limit": 1}
@@ -1606,47 +1672,80 @@ def discover_modeled_iat(data):
             "iat_ordinal": 4, "iat_unmodeled": 5, "direct_call": 6, "memory_or_global": 7,
             "missing_ret": 8,
         }
-        reason = None
+        reasons = set()
+        imports = []
+        direct_targets = []
+        memory = []
+        modeled_calls = 0
         for insn in insns:
             if insn["mnemonic"] == "call_rip":
                 report["callRip"] += 1
                 addr = insn["iat"]
                 fault = iat_slot_fault(addr, image_size)
+                slot = None if fault else slots.get(addr)
                 if fault:
-                    candidate = fault
+                    reasons.add(fault)
+                    imports.append({"iatRva": addr, "fault": fault})
+                elif slot is None:
+                    reasons.add("unknown_iat")
+                    imports.append({"iatRva": addr, "fault": "unknown_iat"})
                 else:
-                    slot = slots.get(addr)
-                    if slot is None:
-                        candidate = "unknown_iat"
-                    elif slot["ordinal"]:
-                        candidate = "iat_ordinal"
-                    elif not slot["modeled"]:
-                        candidate = "iat_unmodeled"
+                    row = {
+                        "iatRva": addr,
+                        "dll": slot["dll"],
+                        "ordinal": slot["ordinal"],
+                        "modeled": slot["modeled"],
+                    }
+                    if slot["ordinal"]:
+                        row["ordinalValue"] = slot.get("ordinalValue")
+                        reasons.add("iat_ordinal")
                     else:
-                        candidate = None
+                        row["name"] = slot["name"]
+                        if slot["modeled"]:
+                            modeled_calls += 1
+                        else:
+                            reasons.add("iat_unmodeled")
+                    imports.append(row)
             elif insn["mnemonic"] == "call":
-                candidate = "direct_call"
+                reasons.add("direct_call")
+                direct_targets.append(insn["target"])
             elif insn["mnemonic"] not in ("mov", "sub", "add", "ret") or insn.get("mem") or insn.get("rip"):
-                candidate = "memory_or_global"
+                reasons.add("memory_or_global")
+                memory.append(_memory_meta(insn, info["sections"], image_size))
             elif insn["mnemonic"] in ("sub", "add") and not any(index == 4 for index, _bits in insn["writes"]):
-                candidate = "memory_or_global"
-            else:
-                candidate = None
-            if candidate is not None and (reason is None or rank[candidate] < rank[reason]):
-                reason = candidate
-        if reason is None and (not insns or insns[-1]["mnemonic"] != "ret"):
-            reason = "missing_ret"
-        if reason is None:
+                reasons.add("memory_or_global")
+                memory.append(_memory_meta(insn, info["sections"], image_size))
+        if not insns or insns[-1]["mnemonic"] != "ret":
+            reasons.add("missing_ret")
+        if not reasons:
             report["eligible"] += 1
             report["eligibleEntries"].append(begin)
         else:
-            obstacles[reason] += 1
+            primary = min(reasons, key=lambda name: rank[name])
+            obstacles[primary] += 1
+            for name in reasons:
+                membership[name] += 1
+        if modeled_calls:
+            report["modeledCandidates"].append({
+                "rva": begin,
+                "end": end,
+                "reasons": sorted(reasons),
+                "modeledCalls": modeled_calls,
+                "imports": imports,
+                "directCallTargets": direct_targets,
+                "memory": memory,
+            })
     report["obstacles"] = dict(obstacles)
+    report["reasonMembership"] = dict(membership)
+    report["modeledCandidateCount"] = len(report["modeledCandidates"])
     report["note"] = (
         "Read-only. No graph was executed and the entry point was not called. "
         "eligibleEntries are RVAs of routines whose only calls are "
-        "KERNEL32 GetLastError or GetCurrentProcessId. An IAT RVA above the "
-        "64 KiB snippet window is not a page crossing. Counts do not include instruction bytes."
+        "KERNEL32 GetLastError or GetCurrentProcessId. obstacles is one primary "
+        "reason per routine. reasonMembership counts every reason. "
+        "modeledCandidates lists every routine that calls one of those two, with "
+        "import names, direct-call RVAs, and access metadata. Width is not an "
+        "object size. No instruction bytes are included."
     )
     return report
 
