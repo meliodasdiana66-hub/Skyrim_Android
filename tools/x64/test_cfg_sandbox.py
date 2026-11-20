@@ -250,7 +250,16 @@ class CfgSandboxTests(unittest.TestCase):
         self.assertTrue(executed[0]["instructions"])
         self.assertNotIn(0x1200, executed[0]["instructions"])
         rejected = {row["entry"]: row["reason"] for row in report["rejections"]}
-        self.assertEqual(rejected[0x1200], "sandbox_untracked")
+        self.assertEqual(rejected[0x1200], "argument_contract_missing")
+        diag = next(row["diagnostic"] for row in report["rejections"] if row["entry"] == 0x1200)
+        self.assertEqual(diag["register"], "rcx")
+        self.assertEqual(diag["role"], "integer_argument_0")
+        self.assertEqual(diag["provenance"], "incoming_unspecified")
+        self.assertEqual(diag["width"], 4)
+        self.assertEqual(diag["category"], "base")
+        self.assertIn("size", diag["missing"])
+        self.assertNotEqual(diag["missing"], [4])
+        self.assertTrue(diag["observedWidthIsNotObjectSize"])
         self.assertEqual(rejected[0x1300], "abi_unpreserved")
         self.assertEqual(rejected[0x1400], "stack_external")
         blob = json.dumps(report)
@@ -259,6 +268,83 @@ class CfgSandboxTests(unittest.TestCase):
         limited = cfg_sandbox.execute_image(bytes(image), max_graphs=1, max_functions=1, max_instructions=32, max_cases=1)
         self.assertEqual(limited["graphsExecuted"], 0)
         self.assertTrue(any(row["reason"] == "too_many_functions" for row in limited["rejections"]))
+        diagnosed = cfg_sandbox.diagnose_image(bytes(image), max_graphs=8, max_functions=4, max_instructions=32)
+        self.assertFalse(diagnosed["executed"])
+        self.assertFalse(diagnosed["speculativeExecution"])
+        self.assertEqual(diagnosed["graphsExecuted"], 0)
+        self.assertEqual(diagnosed["casesExecuted"], 0)
+        by_entry = {row["entry"]: row for row in diagnosed["diagnostics"]}
+        self.assertTrue(by_entry[0x1000]["eligible"])
+        self.assertFalse(by_entry[0x1000]["executed"])
+        self.assertEqual(by_entry[0x1200]["reason"], "argument_contract_missing")
+
+    def test_pointer_provenance_and_synthetic_contract(self):
+        helper = 0x4100
+        # sub rsp, 0x28; lea rcx, [rsp+0x10]; mov dword [rcx], 0x99; call; add rsp, 0x28; ret
+        caller = bytes.fromhex("4883ec28488d4c2410c70199000000")
+        call_at = ENTRY + len(caller)
+        caller += b"\xe8" + struct.pack("<i", helper - (call_at + 5)) + bytes.fromhex("4883c428c3")
+        funcs = {ENTRY: caller, helper: bytes.fromhex("8b01c3")}
+        self.assertIsNone(cfg_sandbox.assess_graph(funcs, ENTRY))
+        report = cfg_sandbox.execute(funcs, ENTRY, _cpu(0), _mem(), DONE, compare_af=False)
+        self.assertEqual(report["rax"], 0x99)
+        lost = bytearray(caller)
+        # replace the trailing add/ret with mov eax,[rcx]; add; ret would change length.
+        # separate program: sub; lea; call; mov eax,[rcx]; add; ret
+        bare = bytes.fromhex("4883ec28488d4c2410")
+        call_at = ENTRY + len(bare)
+        bare += b"\xe8" + struct.pack("<i", helper - (call_at + 5))
+        bare += bytes.fromhex("8b01") + bytes.fromhex("4883c428c3")
+        lost_funcs = {ENTRY: bare, helper: bytes.fromhex("33c0c3")}
+        found = cfg_sandbox.diagnose_graph(lost_funcs, ENTRY)
+        self.assertEqual(found["reason"], "sandbox_untracked")
+        self.assertEqual(found["diagnostic"]["provenance"], "lost_after_call")
+        self.assertEqual(found["diagnostic"]["register"], "rcx")
+        self.assertEqual(found["diagnostic"]["volatility"], "volatile")
+        freed = bytes.fromhex("4883ec28488d4c24104883c4288b01c3")
+        dangling = cfg_sandbox.diagnose_graph({ENTRY: freed}, ENTRY)
+        self.assertEqual(dangling["reason"], "dangling")
+        self.assertEqual(dangling["diagnostic"]["provenance"], "freed_stack")
+        kept = bytes.fromhex("534883ec20488d5c2410")
+        call_at = ENTRY + len(kept)
+        kept += b"\xe8" + struct.pack("<i", helper - (call_at + 5))
+        kept += bytes.fromhex("8b034883c4205bc3")
+        kept_funcs = {ENTRY: kept, helper: bytes.fromhex("31c0c3")}
+        self.assertIsNone(cfg_sandbox.assess_graph(kept_funcs, ENTRY))
+        kept_cpu = _cpu(0)
+        kept_cpu["r"][3] = 0x1234
+        kept_report = cfg_sandbox.execute(kept_funcs, ENTRY, kept_cpu, _mem(), DONE, compare_af=False)
+        self.assertEqual(kept_report["rax"], 0)
+
+    def test_synthetic_argument_object_is_not_game_state(self):
+        helper = 0x4100
+        # mov dword [rcx], eax; call helper; ret / helper: mov eax, [rdx]; ret
+        caller = bytes.fromhex("8901")
+        call_at = ENTRY + len(caller)
+        caller += b"\xe8" + struct.pack("<i", helper - (call_at + 5)) + b"\xc3"
+        funcs = {ENTRY: caller, helper: bytes.fromhex("8b02c3")}
+        missing = cfg_sandbox.diagnose_graph(funcs, ENTRY)
+        self.assertEqual(missing["reason"], "argument_contract_missing")
+        self.assertEqual(missing["diagnostic"]["width"], 4)
+        self.assertIn("size", missing["diagnostic"]["missing"])
+        self.assertNotIn("bytes", missing["diagnostic"])
+        contract = {
+            "rcx": {
+                "name": "object", "guest": 0x2000, "size": 16, "readable": 8, "writable": 4,
+                "guard": 16, "bytes": b"\x00" * 8,
+            },
+            "rdx": {"aliasOf": "rcx", "offset": 0},
+        }
+        cpu = _cpu(0x11223344)
+        report = cfg_sandbox.execute_under_contract(funcs, ENTRY, contract, cpu, _mem(), DONE)
+        self.assertEqual(report["memoryContract"], "synthetic")
+        self.assertFalse(report["actualGameState"])
+        self.assertEqual(report["rax"], 0x11223344)
+        wide = dict(contract)
+        wide["rcx"] = dict(contract["rcx"], writable=2)
+        blocked = cfg_sandbox.diagnose_graph(funcs, ENTRY, contracts=wide)
+        self.assertEqual(blocked["reason"], "contract_bounds")
+        self.assertIsNone(blocked["diagnostic"].get("bytes"))
 
 
 def _image_with(bodies):

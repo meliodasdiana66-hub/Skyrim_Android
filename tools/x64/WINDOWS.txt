@@ -27,7 +27,11 @@ Closed direct-call discovery. This does not execute any graph and does not treat
 
   py -3 cfg_sandbox.py --exe "D:\Skyrim Anniversary Edition\SkyrimSE.exe" --expect-sha256 21A6F8244A57E880D02E600ADF61178AB5483DB7B3CCA8DBFC97D7CA1F081E18 --max-graphs 8 --report "%USERPROFILE%\skyrimse-closed-graphs.json"
 
-Execute only the closed graphs that pass the stack, callee-saved register, and memory contract. --max-graphs, --max-functions, --max-instructions, and --max-cases are the budgets. The PE entry point is not called. A graph that reads an untracked address or a writable global is rejected and not run; those bytes are not invented. verifiedGraphs instructions are RVAs, not bytes. A mismatch stays in the JSON. This is Windows x64 versus Unicorn, not ARM64 and not a game launch.
+Metadata-only diagnosis of closed graphs. This does not execute a graph, even one that would pass. The JSON names the RVA, width, register, and provenance. argument_contract_missing means an incoming pointer had no declared size; the width is not an object layout. No instruction bytes.
+
+  py -3 cfg_sandbox.py --exe "D:\Skyrim Anniversary Edition\SkyrimSE.exe" --expect-sha256 21A6F8244A57E880D02E600ADF61178AB5483DB7B3CCA8DBFC97D7CA1F081E18 --diagnose --max-graphs 1 --max-functions 8 --max-instructions 64 --report "%USERPROFILE%\skyrimse-closed-diagnose.json"
+
+Execute only the closed graphs that pass the stack, callee-saved register, and memory contract. --max-graphs, --max-functions, --max-instructions, and --max-cases are the budgets. The PE entry point is not called. A graph that reads an untracked address or a writable global is rejected and not run; those bytes are not invented. The real 38+52-byte graph was rejected and is not given a synthetic object. verifiedGraphs instructions are RVAs, not bytes. A mismatch stays in the JSON. This is Windows x64 versus Unicorn, not ARM64 and not a game launch.
 
   py -3 cfg_sandbox.py --exe "D:\Skyrim Anniversary Edition\SkyrimSE.exe" --expect-sha256 21A6F8244A57E880D02E600ADF61178AB5483DB7B3CCA8DBFC97D7CA1F081E18 --execute --max-graphs 1 --max-functions 8 --max-instructions 64 --max-cases 4 --report "%USERPROFILE%\skyrimse-closed-execute.json"
 

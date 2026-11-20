@@ -83,7 +83,7 @@ The Anniversary Edition file was not on the machine that added this tool, so no 
 
 The host harness sets Windows stdin and stdout to binary mode before `fread` and `fwrite`. A local `clang.exe` wrapper that force-includes `_setmode` is not part of this package and should be removed from `PATH`.
 
-`cfg_sandbox.py` is a separate guest, not a wider leaf scanner. It accepts an explicit direct `call rel32` and a forward conditional branch, with step, depth, and trip budgets and an isolated stack. Indirect calls, backward branches, recursion, unknown targets, and missing imports are rejected. Discovery assigns every `.pdata` entry one disposition. `--execute` runs only a closed graph that keeps its stack and callee-saved registers and does not touch untracked or writable global memory. A `.pdata` entry is not eligibility. The leaf scanner still rejects `call` and `jcc`.
+`cfg_sandbox.py` is a separate guest, not a wider leaf scanner. It accepts an explicit direct `call rel32` and a forward conditional branch, with step, depth, and trip budgets and an isolated stack. Indirect calls, backward branches, recursion, unknown targets, and missing imports are rejected. Discovery assigns every `.pdata` entry one disposition. `--diagnose` reports pointer provenance and does not execute. `--execute` runs only a closed graph that keeps its stack and callee-saved registers and does not touch untracked or writable global memory. The one real closed graph is rejected and is not treated as success. `guest_mem.c` is a sparse data map with checked access and DIR64; it does not create an executable host page. A `.pdata` entry is not eligibility. The leaf scanner still rejects `call` and `jcc`.
 
 ## AArch64
 

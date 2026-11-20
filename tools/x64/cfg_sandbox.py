@@ -53,9 +53,10 @@ UC_GPRS = [
 
 
 class CfgError(Exception):
-    def __init__(self, reason):
+    def __init__(self, reason, detail=None):
         super().__init__(reason)
         self.reason = reason
+        self.detail = detail or {}
 
 
 def _decode(code, base):
@@ -416,127 +417,312 @@ def _section_at(sections, rva):
     return None
 
 
-def assess_graph(funcs, entry, rip_regions=None, max_functions=MAX_FUNCS, max_instructions=MAX_STEPS_DEFAULT):
-    """Return a rejection reason, or None when the graph may be executed.
+VOLATILE = frozenset({0, 1, 2, 8, 9, 10, 11})
+ARG_ROLE = {1: "integer_argument_0", 2: "integer_argument_1", 8: "integer_argument_2", 9: "integer_argument_3"}
+CONTRACT_FIELDS = ("size", "readable", "writable", "initializedBytes")
 
-    rip_regions are (address, bytes, writable). A missing or writable region is
-    not filled with zeros. None means every RIP access is a precondition.
-    """
+
+def assess_graph(funcs, entry, rip_regions=None, contracts=None, max_functions=MAX_FUNCS,
+                 max_instructions=MAX_STEPS_DEFAULT):
+    """Return a rejection reason, or None when the graph may be executed."""
+    found = diagnose_graph(
+        funcs, entry, rip_regions=rip_regions, contracts=contracts,
+        max_functions=max_functions, max_instructions=max_instructions,
+    )
+    return None if found["ok"] else found["reason"]
+
+
+def diagnose_graph(funcs, entry, rip_regions=None, contracts=None, max_functions=MAX_FUNCS,
+                   max_instructions=MAX_STEPS_DEFAULT):
+    """Explain a rejection. Does not execute the graph and does not invent an object."""
     try:
         prepared = prepare(funcs, entry, max_steps=max_instructions)
     except CfgError as exc:
-        return exc.reason
+        return {"ok": False, "reason": exc.reason, "diagnostic": exc.detail or None}
     if len(prepared["reachable"]) > max_functions:
-        return "too_many_functions"
+        return {"ok": False, "reason": "too_many_functions", "diagnostic": None}
     try:
-        _assess_body(prepared, rip_regions)
+        normalized = _normalize_contracts(contracts)
+        _walk(entry, prepared, 0, _entry_pointers(normalized), [], normalized, _cover(rip_regions), rip_regions is not None)
     except CfgError as exc:
-        return exc.reason
-    return None
+        return {"ok": False, "reason": exc.reason, "diagnostic": exc.detail or None}
+    return {"ok": True, "reason": None, "diagnostic": None}
 
 
-def _assess_body(prepared, rip_regions):
+def _cover(rip_regions):
     covered = []
     if rip_regions is not None:
         for addr, blob, writable in rip_regions:
             covered.append((addr, bytes(blob), bool(writable)))
-    for base in prepared["reachable"]:
-        _assess_function(prepared["insns"][base], covered, rip_regions is not None)
+    return covered
 
 
-def _assess_function(insns, covered, have_regions):
-    delta = 0
+def _reg_meta(index):
+    if index in ARG_ROLE:
+        return ARG_ROLE[index], "volatile"
+    if index in CALLEE_SAVED:
+        return "nonvolatile", "nonvolatile"
+    if index == 4:
+        return "stack_pointer", "nonvolatile"
+    return "volatile", "volatile"
+
+
+def _context(base, delta, ptrs, frames):
+    return {
+        "function": base,
+        "rspDelta": delta,
+        "pointers": [
+            {
+                "register": NAMES[reg],
+                "provenance": prov["kind"],
+                "frame": prov.get("frame"),
+                "offset": prov.get("offset"),
+                "region": prov.get("region"),
+            }
+            for reg, prov in sorted(ptrs.items())
+        ],
+        "liveFrames": [
+            {"id": frame["id"], "owner": frame["owner"], "lo": frame["delta"], "hi": frame["hi"], "live": frame["live"]}
+            for frame in frames if frame["live"]
+        ],
+    }
+
+
+def _detail(insn, category, width, access, reg, provenance, ctx, missing=None):
+    role, volatility = _reg_meta(reg) if reg is not None else (None, None)
+    detail = {
+        "rva": insn["address"],
+        "category": category,
+        "width": width,
+        "access": access,
+        "register": None if reg is None else NAMES[reg],
+        "role": role,
+        "volatility": volatility,
+        "provenance": provenance,
+        "callContext": ctx,
+    }
+    if missing is not None:
+        detail["missing"] = list(missing)
+        detail["observedWidthIsNotObjectSize"] = True
+    return detail
+
+
+def _normalize_contracts(contracts):
+    if not contracts:
+        return {}
+    primary = {}
+    for name, spec in contracts.items():
+        if name not in NAMES:
+            raise CfgError("contract_register")
+        if "aliasOf" in spec:
+            continue
+        for field in ("name", "guest", "size", "readable", "writable", "bytes"):
+            if field not in spec:
+                raise CfgError("contract_shape")
+        if not (0 <= spec["writable"] <= spec["readable"] <= spec["size"]):
+            raise CfgError("contract_shape")
+        if len(spec["bytes"]) < spec["readable"]:
+            raise CfgError("contract_shape")
+        if spec["guest"] < 0 or spec["guest"] + spec["size"] > STACK_LO:
+            raise CfgError("contract_overlap")
+        primary[name] = spec
+    spans = []
+    for spec in primary.values():
+        guard = spec.get("guard", 0)
+        if guard < 0:
+            raise CfgError("contract_shape")
+        lo = spec["guest"] - guard
+        hi = spec["guest"] + spec["size"] + guard
+        if lo < 0 or hi > STACK_LO:
+            raise CfgError("contract_overlap")
+        spans.append((lo, hi))
+    spans.sort()
+    for (lo, hi), (lo2, _hi2) in zip(spans, spans[1:]):
+        if hi > lo2:
+            raise CfgError("contract_overlap")
+    out = dict(primary)
+    for name, spec in contracts.items():
+        if "aliasOf" not in spec:
+            continue
+        base = primary.get(spec["aliasOf"])
+        if base is None:
+            raise CfgError("contract_alias")
+        offset = spec.get("offset", 0)
+        if offset < 0 or offset > base["readable"]:
+            raise CfgError("contract_shape")
+        out[name] = {
+            "aliasOf": spec["aliasOf"],
+            "name": base["name"],
+            "guest": base["guest"],
+            "size": base["size"],
+            "readable": base["readable"],
+            "writable": base["writable"],
+            "bytes": base["bytes"],
+            "offset": offset,
+        }
+    return out
+
+
+def _entry_pointers(contracts):
     ptrs = {}
+    for name, spec in contracts.items():
+        ptrs[NAMES.index(name)] = {
+            "kind": "argument",
+            "region": spec["name"],
+            "offset": spec.get("offset", 0),
+        }
+    return ptrs
+
+
+def _walk(base, prepared, entry_delta, ptrs, frames, contracts, covered, have_regions):
+    if len(frames) > MAX_DEPTH_DEFAULT:
+        raise CfgError("depth_budget")
+    frame = {"id": len(frames), "owner": base, "delta": entry_delta, "hi": entry_delta, "live": True}
+    frames.append(frame)
+    delta = entry_delta
     dirty = set()
     slots = []
+    killed = set()
+    defined = set()
+    insns = prepared["insns"][base]
     for insn in insns:
+        ctx = _context(base, delta, ptrs, frames)
         if insn.get("xmm") is not None:
-            raise CfgError("xmm_untracked")
+            raise CfgError("xmm_untracked", _detail(insn, "xmm", 16, "access", None, "none", ctx))
         if insn["mnemonic"] == "ret":
-            if delta != 0 or slots:
-                raise CfgError("stack_unbalanced")
+            if delta != frame["hi"] or slots:
+                raise CfgError("stack_unbalanced", _detail(insn, "rsp", 8, "ret", 4, "stack", ctx))
             if dirty & CALLEE_SAVED:
-                raise CfgError("abi_unpreserved")
-            continue
+                reg = sorted(dirty & CALLEE_SAVED)[0]
+                raise CfgError("abi_unpreserved", _detail(insn, "register", 8, "ret", reg, "clobbered", ctx))
+            frame["live"] = False
+            return
         if insn["mnemonic"] == "call":
             if STACK_TOP + delta - 8 < STACK_LO:
-                raise CfgError("stack_window")
-            for index in list(ptrs):
-                if index not in CALLEE_SAVED:
-                    ptrs.pop(index, None)
+                raise CfgError("stack_window", _detail(insn, "rsp", 8, "call", 4, "stack", ctx))
+            _walk(insn["target"], prepared, delta - 8, dict(ptrs), frames, contracts, covered, have_regions)
+            for reg in list(ptrs):
+                if reg in VOLATILE:
+                    ptrs.pop(reg, None)
+                    killed.add(reg)
             continue
         if insn["mnemonic"] in ("add", "sub") and any(index == 4 for index, _bits in insn["writes"]):
             if "imm" not in insn:
-                raise CfgError("rsp_untracked")
+                raise CfgError("rsp_untracked", _detail(insn, "rsp", 8, insn["mnemonic"], 4, "none", ctx))
             delta += insn["imm"] if insn["mnemonic"] == "add" else -insn["imm"]
-            if delta > 0:
-                raise CfgError("stack_underflow")
+            if delta > frame["hi"]:
+                raise CfgError("stack_underflow", _detail(insn, "rsp", 8, insn["mnemonic"], 4, "stack", ctx))
             if STACK_TOP + delta < STACK_LO:
-                raise CfgError("stack_window")
+                raise CfgError("stack_window", _detail(insn, "rsp", 8, insn["mnemonic"], 4, "stack", ctx))
+            frame["delta"] = delta
             continue
         if any(index == 4 for index, _bits in insn["writes"]) and not insn.get("stack"):
-            raise CfgError("rsp_untracked")
+            raise CfgError("rsp_untracked", _detail(insn, "rsp", 8, insn["mnemonic"], 4, "none", ctx))
         if insn.get("rip"):
             target, nbytes = insn["rip"]
-            if insn.get("writes"):
-                if not have_regions or not _region_covers(covered, target, nbytes, store=False):
-                    raise CfgError("precondition_required")
-            else:
-                raise CfgError("precondition_required")
-            _kill_writes(insn, ptrs, dirty)
+            access = "load" if insn.get("writes") else "store"
+            if access == "store" or not have_regions or not _region_covers(covered, target, nbytes, store=False):
+                raise CfgError("precondition_required", _detail(insn, "rip", nbytes, access, None, "global", ctx))
+            _kill_writes(insn, ptrs, dirty, defined, killed)
             continue
         if insn["mnemonic"] == "lea":
             dest = insn["writes"][0][0]
             disp = insn.get("leaDisp")
             srcs = [index for index, _bits in insn["reads"]]
             if disp is not None and srcs == [4]:
-                ptrs[dest] = delta + disp
+                offset = delta + disp
+                if not (frame["delta"] <= offset < frame["hi"]):
+                    raise CfgError("stack_external", _detail(insn, "rsp", 8, "lea", 4, "stack", ctx))
+                ptrs[dest] = {"kind": "stack", "frame": frame["id"], "offset": offset}
             elif disp is not None and len(srcs) == 1 and srcs[0] in ptrs:
-                ptrs[dest] = ptrs[srcs[0]] + disp
+                src = ptrs[srcs[0]]
+                ptrs[dest] = dict(src)
+                ptrs[dest]["offset"] = src["offset"] + disp
             else:
                 ptrs.pop(dest, None)
+            defined.add(dest)
+            killed.discard(dest)
             if dest in CALLEE_SAVED:
                 dirty.add(dest)
             continue
         stack = insn.get("stack")
-        if stack:
-            if stack[0] == "push":
-                delta -= stack[1]
-                if STACK_TOP + delta < STACK_LO:
-                    raise CfgError("stack_window")
-                regs = [index for index, _bits in insn["reads"]]
-                reg = regs[0] if regs else None
-                slots.append((reg, reg is not None and reg not in dirty))
-                continue
-            if stack[0] == "pop":
-                if delta >= 0 or not slots:
-                    raise CfgError("stack_underflow")
-                delta += stack[1]
-                saved, original = slots.pop()
-                dests = [index for index, _bits in insn["writes"] if index != 4]
-                dest = dests[0]
-                ptrs.pop(dest, None)
-                if dest == saved and original:
-                    dirty.discard(dest)
-                elif dest in CALLEE_SAVED:
-                    dirty.add(dest)
-                continue
+        if stack and stack[0] == "push":
+            delta -= stack[1]
+            if STACK_TOP + delta < STACK_LO:
+                raise CfgError("stack_window", _detail(insn, "rsp", stack[1], "push", 4, "stack", ctx))
+            frame["delta"] = delta
+            regs = [index for index, _bits in insn["reads"]]
+            reg = regs[0] if regs else None
+            slots.append((reg, reg is not None and reg not in dirty))
+            continue
+        if stack and stack[0] == "pop":
+            if delta >= frame["hi"] or not slots:
+                raise CfgError("stack_underflow", _detail(insn, "rsp", stack[1], "pop", 4, "stack", ctx))
+            delta += stack[1]
+            frame["delta"] = delta
+            saved, original = slots.pop()
+            dest = [index for index, _bits in insn["writes"] if index != 4][0]
+            ptrs.pop(dest, None)
+            defined.add(dest)
+            killed.discard(dest)
+            if dest == saved and original:
+                dirty.discard(dest)
+            elif dest in CALLEE_SAVED:
+                dirty.add(dest)
+            continue
         mem = insn.get("mem")
         if mem and mem[0] == "rsp":
-            _base, disp, nbytes, _kind = mem
-            if not _slot_in_frame(delta, delta + disp, nbytes):
-                raise CfgError("stack_external")
-            _kill_writes(insn, ptrs, dirty)
+            _base, disp, nbytes, kind = mem
+            offset = delta + disp
+            if not (frame["delta"] <= offset and offset + nbytes <= frame["hi"]):
+                raise CfgError("stack_external", _detail(insn, "rsp", nbytes, kind, 4, "stack", ctx))
+            _kill_writes(insn, ptrs, dirty, defined, killed)
             continue
         if mem and mem[0] == "base":
-            _tag, base, disp, nbytes, _kind = mem
-            if base not in ptrs:
-                raise CfgError("sandbox_untracked")
-            if not _slot_in_frame(delta, ptrs[base] + disp, nbytes):
-                raise CfgError("stack_external")
-            _kill_writes(insn, ptrs, dirty)
+            _tag, reg, disp, nbytes, kind = mem
+            _use_base(insn, reg, disp, nbytes, kind, ptrs, frames, contracts, killed, defined, ctx)
+            _kill_writes(insn, ptrs, dirty, defined, killed)
             continue
-        _kill_writes(insn, ptrs, dirty)
+        _kill_writes(insn, ptrs, dirty, defined, killed)
+    raise CfgError("missing_ret")
+
+
+def _use_base(insn, reg, disp, nbytes, kind, ptrs, frames, contracts, killed, defined, ctx):
+    prov = ptrs.get(reg)
+    if prov is None:
+        if reg in ARG_ROLE and reg not in defined and reg not in killed:
+            raise CfgError("argument_contract_missing", _detail(
+                insn, "base", nbytes, kind, reg, "incoming_unspecified", ctx, CONTRACT_FIELDS))
+        provenance = "lost_after_call" if reg in killed else "none"
+        raise CfgError("sandbox_untracked", _detail(insn, "base", nbytes, kind, reg, provenance, ctx))
+    if prov["kind"] == "stack":
+        frame = frames[prov["frame"]]
+        offset = prov["offset"] + disp
+        if not frame["live"] or offset < frame["delta"]:
+            raise CfgError("dangling", _detail(insn, "base", nbytes, kind, reg, "freed_stack", ctx))
+        if offset + nbytes > frame["hi"]:
+            raise CfgError("stack_external", _detail(insn, "base", nbytes, kind, reg, "stack", ctx))
+        return
+    region = None
+    for spec in contracts.values():
+        if spec["name"] == prov["region"] and "aliasOf" not in spec:
+            region = spec
+            break
+    offset = prov["offset"] + disp
+    limit = region["writable"] if kind == "store" else region["readable"]
+    if region is None or offset < 0 or offset + nbytes > limit:
+        raise CfgError("contract_bounds", _detail(insn, "base", nbytes, kind, reg, "argument", ctx))
+
+
+def _kill_writes(insn, ptrs, dirty, defined, killed):
+    for index, _bits in insn.get("writes") or []:
+        if index == 4:
+            continue
+        ptrs.pop(index, None)
+        defined.add(index)
+        killed.discard(index)
+        if index in CALLEE_SAVED:
+            dirty.add(index)
 
 
 def _slot_in_frame(frame_delta, absolute, nbytes):
@@ -554,15 +740,6 @@ def _region_covers(covered, target, nbytes, store):
                 return False
             return True
     return False
-
-
-def _kill_writes(insn, ptrs, dirty):
-    for index, _bits in insn.get("writes") or []:
-        if index == 4:
-            continue
-        ptrs.pop(index, None)
-        if index in CALLEE_SAVED:
-            dirty.add(index)
 
 
 def _relocate(funcs, rip_blobs):
@@ -654,6 +831,79 @@ def _graph_cases(max_cases):
     return specs[:max(0, max_cases)]
 
 
+def diagnose_image(data, max_graphs=8, max_functions=8, max_instructions=64):
+    """Assess closed graphs and stop. Never executes them."""
+    public, graphs, info = _analyze(data)
+    selected = graphs[:max_graphs]
+    rows = []
+    entry_rva = info.get("addressOfEntryPoint")
+    for graph in selected:
+        if any(begin <= entry_rva < begin + len(graph["code"][begin]) for begin in graph["code"]):
+            rows.append({"entry": graph["entry"], "eligible": False, "reason": "contains_entry_point",
+                         "diagnostic": None, "executed": False})
+            continue
+        if len(graph["functions"]) > max_functions:
+            rows.append({"entry": graph["entry"], "eligible": False, "reason": "too_many_functions",
+                         "diagnostic": None, "executed": False})
+            continue
+        if graph["instructionCount"] > max_instructions:
+            rows.append({"entry": graph["entry"], "eligible": False, "reason": "step_budget",
+                         "diagnostic": None, "executed": False})
+            continue
+        regions = _rip_regions(graph, info["sections"], data)
+        if isinstance(regions, str):
+            rows.append({"entry": graph["entry"], "eligible": False, "reason": regions,
+                         "diagnostic": None, "executed": False})
+            continue
+        found = diagnose_graph(
+            graph["code"], graph["entry"], rip_regions=regions,
+            max_functions=max_functions, max_instructions=max_instructions,
+        )
+        rows.append({
+            "entry": graph["entry"],
+            "eligible": found["ok"],
+            "reason": found["reason"],
+            "diagnostic": found["diagnostic"],
+            "executed": False,
+        })
+    public["closedGraphs"] = [_public_graph(graph) for graph in graphs[:max_graphs]]
+    public["mode"] = "diagnose"
+    public["executed"] = False
+    public["speculativeExecution"] = False
+    public["entryPointExecuted"] = False
+    public["graphsDiscovered"] = public["closedGraphsFound"]
+    public["graphsSelected"] = len(selected)
+    public["graphsExecuted"] = 0
+    public["casesExecuted"] = 0
+    public["diagnostics"] = rows
+    public["note"] = (
+        "Diagnostic only. No graph was executed. An incoming pointer without a declared "
+        "contract is argument_contract_missing; the access width is not an object size."
+    )
+    return public
+
+
+def execute_under_contract(funcs, entry, contract, cpu, mem, return_ip=DONE, max_steps=MAX_STEPS_DEFAULT):
+    """Run one synthetic program against a declared object. This is not game state."""
+    found = diagnose_graph(funcs, entry, contracts=contract, max_instructions=max_steps)
+    if not found["ok"]:
+        raise CfgError(found["reason"], found["diagnostic"])
+    normalized = _normalize_contracts(contract)
+    image = bytearray(mem)
+    for name, spec in normalized.items():
+        if "aliasOf" in spec:
+            continue
+        guest = spec["guest"]
+        blob = bytes(spec["bytes"][:spec["size"]])
+        image[guest:guest + len(blob)] = blob
+    for name, spec in normalized.items():
+        cpu["r"][NAMES.index(name)] = spec["guest"] + spec.get("offset", 0)
+    result = execute(funcs, entry, cpu, image, return_ip, max_steps=max_steps, compare_af=False)
+    result["memoryContract"] = "synthetic"
+    result["actualGameState"] = False
+    return result
+
+
 def execute_image(data, max_graphs=8, max_functions=8, max_instructions=64, max_cases=4):
     """Execute discovered closed graphs that pass the safety contract.
 
@@ -682,12 +932,16 @@ def execute_image(data, max_graphs=8, max_functions=8, max_instructions=64, max_
         if isinstance(regions, str):
             rejections.append({"entry": graph["entry"], "reason": regions})
             continue
-        reason = assess_graph(
+        found = diagnose_graph(
             graph["code"], graph["entry"], rip_regions=regions,
             max_functions=max_functions, max_instructions=max_instructions,
         )
-        if reason:
-            rejections.append({"entry": graph["entry"], "reason": reason})
+        if not found["ok"]:
+            rejections.append({
+                "entry": graph["entry"],
+                "reason": found["reason"],
+                "diagnostic": found["diagnostic"],
+            })
             continue
         try:
             guest_funcs, mapping, copies = _relocate(graph["code"], [(addr, blob) for addr, blob, _writable in regions])
@@ -937,6 +1191,8 @@ def main(argv=None):
     parser.add_argument("--expect-sha256", required=True)
     parser.add_argument("--execute", action="store_true",
                         help="run closed graphs that pass the safety contract; does not call the PE entry")
+    parser.add_argument("--diagnose", action="store_true",
+                        help="metadata-only rejection report; does not execute any graph")
     parser.add_argument("--max-graphs", type=int, default=8)
     parser.add_argument("--max-functions", type=int, default=8)
     parser.add_argument("--max-instructions", type=int, default=64)
@@ -955,8 +1211,16 @@ def main(argv=None):
     if digest.lower() != args.expect_sha256.lower():
         print("sha256 mismatch", file=sys.stderr)
         return 3
+    if args.execute and args.diagnose:
+        print("choose only one of --execute and --diagnose", file=sys.stderr)
+        return 2
     try:
-        if args.execute:
+        if args.diagnose:
+            report = diagnose_image(
+                data, max_graphs=args.max_graphs, max_functions=args.max_functions,
+                max_instructions=args.max_instructions,
+            )
+        elif args.execute:
             report = execute_image(
                 data, max_graphs=args.max_graphs, max_functions=args.max_functions,
                 max_instructions=args.max_instructions, max_cases=args.max_cases,
@@ -967,7 +1231,12 @@ def main(argv=None):
         print("pe: %s" % exc, file=sys.stderr)
         return 2
     report["sha256"] = digest
-    if not args.execute:
+    if args.diagnose:
+        report["note"] = (
+            "Diagnostic only. No graph was executed. argument_contract_missing does not "
+            "supply an object size; the observed access width is not a layout."
+        )
+    elif not args.execute:
         report["note"] = (
             "dispositions assign every pdata entry once. closedGraphs are roots only; "
             "members are not extra graphs and call-free bodies are not rejects. "
