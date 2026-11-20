@@ -354,6 +354,50 @@ class LiftTests(unittest.TestCase):
         self.assertEqual(got["r"][4], 0xDFF8)
         self.assertEqual(got["cf"], 1)
 
+    def test_sub_rsp_immediate_flags_and_alignment(self):
+        # sub rsp, 0x28 from an entry-like RSP (8 mod 16) lands 0 mod 16.
+        code = bytes.fromhex("4883ec28")
+        state = cpu(rsp=0xE008, cf=1)
+        check(code, BASE, state)
+        got = difftest64.run_host(code, BASE, state, mem_with(code, BASE))
+        self.assertEqual(got["r"][4], 0xDFE0)
+        self.assertEqual(got["r"][4] % 16, 0)
+        self.assertEqual(got["cf"], 0)
+        # sub rsp, 0x20 stays 8 mod 16. The instruction is still valid.
+        narrow = bytes.fromhex("4883ec20")
+        state = cpu(rsp=0xE008)
+        check(narrow, BASE, state)
+        got = difftest64.run_host(narrow, BASE, state, mem_with(narrow, BASE))
+        self.assertEqual(got["r"][4] % 16, 8)
+        # sub rax, 1 borrows.
+        borrow = bytes.fromhex("4883e801")
+        state = cpu(rax=0)
+        check(borrow, BASE, state)
+        got = difftest64.run_host(borrow, BASE, state, mem_with(borrow, BASE))
+        self.assertEqual(got["r"][0], 0xFFFFFFFFFFFFFFFF)
+        self.assertEqual(got["cf"], 1)
+
+    def test_lea_forms_do_not_read_memory(self):
+        # lea rax, [rcx+8]; flags stay set; memory unchanged.
+        code = bytes.fromhex("488d4108")
+        state = cpu(rcx=0x10, cf=1, zf=1)
+        image = mem_with(code, BASE)
+        image[0x18:0x20] = b"\xff" * 8
+        check(code, BASE, state)
+        got_cpu, got_mem = difftest64.run_both(code, BASE, state, image)
+        self.assertEqual(got_cpu["r"][0], 0x18)
+        self.assertEqual(got_cpu["cf"], 1)
+        self.assertEqual(got_cpu["zf"], 1)
+        self.assertEqual(bytes(got_mem[0x18:0x20]), b"\xff" * 8)
+        # 32-bit lea zero-extends.
+        code = bytes.fromhex("8d4101")
+        state = cpu(rax=0xFFFFFFFFFFFFFFFF, rcx=0xFFFFFFFFFFFFFFFF)
+        check(code, BASE, state)
+        got = difftest64.run_host(code, BASE, state, mem_with(code, BASE))
+        self.assertEqual(got["r"][0], 0)
+        with self.assertRaises(decode_allow.Reject):
+            decode_allow.decode_stream(bytes.fromhex("488d0458"), BASE)  # lea rax, [rax+rbx*2]
+
     def test_push_rsp_and_call_stay_rejected(self):
         with self.assertRaises(lift64.Unsupported):
             lift64.lift_snippet(bytes.fromhex("54"), BASE)

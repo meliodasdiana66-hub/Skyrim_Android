@@ -18,5 +18,8 @@ Execute that selection. Needs capstone, unicorn, and clang already installed. Th
 Import inventory only. The 56 MiB image is refused for mapping. No entry point is called.
 
   py -3 pe32plus_load.py --exe "D:\Skyrim Anniversary Edition\SkyrimSE.exe" --expect-sha256 21A6F8244A57E880D02E600ADF61178AB5483DB7B3CCA8DBFC97D7CA1F081E18 --inventory > "%USERPROFILE%\skyrimse-pe-inventory.json"
+py -3 pe32plus_load.py --exe "D:\Skyrim Anniversary Edition\SkyrimSE.exe" --expect-sha256 21A6F8244A57E880D02E600ADF61178AB5483DB7B3CCA8DBFC97D7CA1F081E18 --logical-map > "%USERPROFILE%\skyrimse-logical-map.json"
+
+--logical-map prints RVA intervals, permissions, zero-fill and gaps. It does not allocate 59 MiB, does not copy section bytes, and does not call the entry point.
 
 Exit code 3 means the SHA-256 did not match and nothing was scanned.

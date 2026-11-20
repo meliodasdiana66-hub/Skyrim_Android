@@ -80,7 +80,90 @@ def inventory(data):
         ],
         "graphicsImportsNotImplemented": graphics,
         "mapRefused": info["sizeOfImage"] > MAX_MAP,
-        "mapRefusal": "SizeOfImage exceeds the 1 MiB synthetic map cap" if info["sizeOfImage"] > MAX_MAP else None,
+        "mapRefusal": (
+            "dense bytearray copy refused above 1 MiB; logical intervals do not allocate SizeOfImage"
+            if info["sizeOfImage"] > MAX_MAP else None),
+        "guestAllocation": None,
+        "logicalIntervalCount": len(logical_intervals(info)),
+    }
+
+
+def _perms(chars):
+    return {
+        "read": bool(chars & 0x40000000),
+        "write": bool(chars & 0x80000000),
+        "execute": bool(chars & 0x20000000),
+    }
+
+
+def logical_intervals(info):
+    """Describe the image as RVA intervals. Does not allocate SizeOfImage or copy bytes."""
+    size = info["sizeOfImage"]
+    if size <= 0 or size > 0x7FFFFFFF:
+        raise LoadError("SizeOfImage is not a usable logical span")
+    headers = min(info["sizeOfHeaders"], size)
+    intervals = []
+    cursor = 0
+    if headers:
+        intervals.append({
+            "start": 0, "end": headers, "state": "file-backed", "role": "headers",
+            "permissions": {"read": True, "write": False, "execute": False},
+            "materialized": False,
+        })
+        cursor = headers
+    for sec in sorted(info["sections"], key=lambda item: item["virtualAddress"]):
+        va = sec["virtualAddress"]
+        if va >= size:
+            continue
+        vend = min(size, va + sec["virtualSize"])
+        if cursor < va:
+            intervals.append({"start": cursor, "end": va, "state": "unmapped", "role": "gap", "materialized": False})
+        backed = min(sec["sizeOfRawData"], sec["virtualSize"], vend - va)
+        perms = _perms(sec["characteristics"])
+        if backed:
+            intervals.append({
+                "start": va, "end": va + backed, "state": "file-backed", "role": "section",
+                "section": sec["name"], "fileOffset": sec["pointerToRawData"],
+                "permissions": perms, "materialized": False,
+            })
+        if va + backed < vend:
+            intervals.append({
+                "start": va + backed, "end": vend, "state": "zero-fill", "role": "section",
+                "section": sec["name"], "permissions": perms, "materialized": False,
+            })
+        cursor = max(cursor, vend)
+    if cursor < size:
+        intervals.append({"start": cursor, "end": size, "state": "unmapped", "role": "tail", "materialized": False})
+    covered = 0
+    previous = 0
+    for row in intervals:
+        if row["start"] != previous or row["end"] < row["start"]:
+            raise LoadError("logical intervals do not tile the image")
+        covered += row["end"] - row["start"]
+        previous = row["end"]
+    if covered != size or previous != size:
+        raise LoadError("logical intervals do not cover SizeOfImage")
+    return intervals
+
+
+def logical_map(data):
+    """Sparse description of a PE32+ image. No guest allocation and no entry call."""
+    info = inspect_pe32plus.inspect_bytes(data)
+    tls = info.get("tlsDirectory") or {"present": False}
+    return {
+        "kind": "logical-map",
+        "guestAllocation": None,
+        "addressSpace": "rva-intervals",
+        "sizeOfImage": info["sizeOfImage"],
+        "entryCalled": False,
+        "importsBound": False,
+        "relocationsApplied": False,
+        "tlsCallbacksRun": False,
+        "unwindDispatched": False,
+        "originalBytesCopied": False,
+        "exceptionDirectoryPresent": info["exceptionDirectory"]["present"],
+        "tlsPresent": bool(tls.get("present")),
+        "intervals": logical_intervals(info),
     }
 
 
@@ -151,6 +234,8 @@ def main(argv=None):
     parser.add_argument("--exe", required=True)
     parser.add_argument("--expect-sha256")
     parser.add_argument("--inventory", action="store_true")
+    parser.add_argument("--logical-map", action="store_true",
+                        help="print RVA intervals only; does not copy section bytes or call the entry")
     args = parser.parse_args(argv)
     path = Path(args.exe)
     if not path.is_file():
@@ -165,8 +250,8 @@ def main(argv=None):
         print("sha256 mismatch", file=sys.stderr)
         return 3
     try:
-        report = inventory(data)
-    except inspect_pe32plus.PeFormatError as exc:
+        report = logical_map(data) if args.logical_map else inventory(data)
+    except (inspect_pe32plus.PeFormatError, LoadError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
     report["sha256"] = digest

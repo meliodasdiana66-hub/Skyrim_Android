@@ -33,7 +33,8 @@ The lifter raises `Unsupported` and emits no runnable function for:
 - high-byte registers `AH`/`CH`/`DH`/`BH`
 - indexed memory, absolute memory, and ALU or `movzx` memory forms not listed above
 - `syscall`, calls, jumps, and every other mnemonic
-- `push`/`pop` of RSP, 16-bit `push`/`pop`, and any stack access outside the frame this leaf allocated
+- `push`/`pop` of RSP, 16-bit `push`/`pop`, and any stack access outside the frame this leaf allocated (`sub rsp, imm` allocates; `add rsp, imm` frees; a later read of a freed slot is rejected)
+- indexed `lea`
 - any `ret` except one final unprefixed `C3`, which is recognized and then not executed
 
 `inspect_pe32plus.py` and `leafcheck.py` are the tools that open a PE. They accept `IMAGE_FILE_MACHINE_AMD64` and magic `0x20B` only. `ImageBase` is the 8-byte field at optional-header offset 24. Import thunks are 8 bytes, read from the data directory at optional-header offset 112. The entry-point RVA is printed and not disassembled. A `.bind` section is reported as a section; its presence or absence is not evidence that bytes are encrypted or decrypted.

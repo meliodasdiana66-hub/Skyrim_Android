@@ -11,7 +11,7 @@ MAX_CODE = 4096
 
 ALLOW = frozenset({
     "nop", "mov", "movabs", "movzx", "add", "sub", "cmp", "and", "or", "xor", "test",
-    "push", "pop",
+    "push", "pop", "lea",
 })
 
 _WIDTHS = (
@@ -161,6 +161,14 @@ def _emit(insn):
     if len(ops) != 2:
         raise Unsupported("operand form rejected at %#x" % insn.address)
     dst, src = ops
+    if mn == "lea":
+        if len(ops) != 2 or ops[0].type != x86.X86_OP_REG or ops[1].type != x86.X86_OP_MEM:
+            raise Unsupported("lea form rejected at %#x" % insn.address)
+        index, bits = _reg(insn, ops[0])
+        if bits not in (32, 64) or index == 4:
+            raise Unsupported("lea form rejected at %#x" % insn.address)
+        ea, _size = _mem(insn, ops[1])
+        return [comment, "wr(c, %d, %s, %d);" % (index, ea, bits)]
     if mn in ("mov", "movabs"):
         if dst.type == x86.X86_OP_REG and src.type == x86.X86_OP_IMM:
             index, bits = _reg(insn, dst)
@@ -201,7 +209,7 @@ def _emit(insn):
             if sb != db:
                 raise Unsupported("%s width mismatch at %#x" % (mn, insn.address))
             src_expr = "rd(c, %d, %d)" % (si, sb)
-        elif src.type == x86.X86_OP_IMM and mn == "add":
+        elif src.type == x86.X86_OP_IMM and mn in ("add", "sub"):
             src_expr = "%#xull" % _imm(src, db)
         else:
             raise Unsupported("%s form rejected at %#x" % (mn, insn.address))

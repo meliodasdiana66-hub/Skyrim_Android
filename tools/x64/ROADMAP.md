@@ -1,0 +1,21 @@
+# AE 1.6.1170 checkpoint
+
+This is not a playable port. The 2011 pipeline is unchanged. Nothing here calls `SkyrimSE.exe`.
+
+## Done
+
+- Allowlisted x64 snippets, compared with Unicorn. One `push`/`pop` snippet also ran under QEMU user-mode. That is not Android and not Adreno.
+- Leaf scan of the real image, on the owner's PC: 212 straight-line leaves, 848 cases, no divergence. Report cap and execute cap are independent.
+- `sub rsp, imm` / `add rsp, imm` with a proven frame, flag results, and 16-byte alignment recorded from an entry RSP that is 8 mod 16. Calls, branches, and accesses outside that frame stay rejected.
+- `lea r64/r32, [base+disp]`, `[rsp+disp]`, and `[rip+disp]` without a memory read. Indexed LEA stays rejected.
+- Logical RVA intervals for the 59 MiB `SizeOfImage`: file-backed, zero-fill, unmapped gaps, section permissions. No guest allocation and no copy of section bytes. Dense `map_synthetic` is still capped at 1 MiB. Imports, TLS callbacks, unwind, and the entry point are recorded as not run.
+
+## Not done, in order
+
+1. More straight-line ops that real leaves hit after `sub rsp` (`movaps` for 16-byte spills, `movsxd`, shifts). Still no calls.
+2. A translated call/return ABI with a real stack and a host import table. Until that exists, functions that call `d3d11.dll` or anything else cannot run.
+3. Bind the inventoried imports that are not graphics (`kernel32` file/heap/thread subset) to the existing host shims, still without calling the EXE entry.
+4. Only then a single translated leaf that contains a call, on a synthetic image. The game entry point stays uncalled.
+5. D3D11/Vulkan and Android packaging are after a translated call works. The launcher UI waits on that.
+
+`sub rsp` will not by itself turn the 83,790 prologue rejects into running functions. Most of those functions also contain a call or a branch.

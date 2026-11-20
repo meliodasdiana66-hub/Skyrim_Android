@@ -22,7 +22,8 @@ DEFAULT_MAX_FUNCTIONS = 64
 DEFAULT_MAX_CASES = 4
 SAFETY_CAP = 4096
 STACK_LO = 0xC000
-STACK_TOP = 0xE000
+# 8 mod 16, matching an x64 entry RSP after the caller's push of the return address.
+STACK_TOP = 0xE008
 EXPECTED_SHA = "21a6f8244a57e880d02e600adf61178ab5483db7b3cca8dbfc97d7ca1f081e18"
 
 CASES = (
@@ -57,18 +58,25 @@ def _analyze_stack(insns):
     Returns None when the leaf does not touch the stack. A string is a rejection
     reason. A dict means RSP must be pinned to STACK_TOP for execution.
     """
-    stackish = any(insn.get("stack") or (insn.get("mem") or [None])[0] == "rsp" for insn in insns)
+    def _writes_rsp(insn):
+        return any(index == 4 for index, _bits in insn["writes"])
+
+    has_sub_rsp = any(insn["mnemonic"] == "sub" and _writes_rsp(insn) for insn in insns)
+    stackish = has_sub_rsp or any(
+        insn.get("stack") or (insn.get("mem") or [None])[0] == "rsp" for insn in insns)
     if not stackish:
+        # Lone `add rsp, imm` only changes the register. It stays on the
+        # varying-RSP cases so previously matched leaves are not dropped.
         return None
     delta = 0
     deepest = 0
     for insn in insns:
         if insn["mnemonic"] == "ret":
             continue
-        if insn["mnemonic"] == "add" and any(index == 4 for index, _bits in insn["writes"]):
+        if insn["mnemonic"] in ("add", "sub") and _writes_rsp(insn):
             if "imm" not in insn:
                 return "rsp_untracked"
-            delta += insn["imm"]
+            delta += insn["imm"] if insn["mnemonic"] == "add" else -insn["imm"]
             if delta > 0:
                 return "stack_underflow"
             if STACK_TOP + delta < STACK_LO:
@@ -101,7 +109,13 @@ def _analyze_stack(insns):
             if not (frame_lo <= lo and hi <= STACK_TOP):
                 return "stack_external"
             continue
-    return {"pinnedRsp": STACK_TOP, "maxDepth": -deepest}
+    final = STACK_TOP + delta
+    return {
+        "pinnedRsp": STACK_TOP,
+        "maxDepth": -deepest,
+        "entryRspMod16": STACK_TOP % 16,
+        "finalRspMod16": final % 16,
+    }
 
 
 def _inputs(insns):
@@ -194,6 +208,7 @@ def _consider(data, sections, image_base, entry, begin, end):
         "ripRvas": rip_rvas,
         "guestBase": guest,
         "stackPinned": bool(stack),
+        "finalRspMod16": None if not stack else stack["finalRspMod16"],
         "status": "candidate_not_executed",
     }
     private = {

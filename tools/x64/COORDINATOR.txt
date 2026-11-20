@@ -8,6 +8,8 @@ Previous local run, metadata only, same SHA-256 21A6F8244A57E880D02E600ADF61178A
   largest rejection counts: push 46288, memory_form 44236, unsupported 21777, jcc 2743, pop 2449, call 966
 That run did not execute on ARM64 and did not start the game.
 
+Run 4 on the same SHA-256 executed all 212 candidates, 848/848 match, zero divergence. functionsSelected was 212 while the JSON sample stayed at 32 or 64. push/pop added no new leaves. unsupported was 96813, and 83790 of those were sub rsp, imm.
+
 This revision:
   candidatesFound is independent of functionsSelected.
   --max-functions 0 selects every candidate up to 4096, which includes those 212.
@@ -17,4 +19,6 @@ This revision:
   One push/pop snippet was executed under qemu-aarch64-static on the development VM. That is QEMU user-mode, not a phone, not Adreno, and not the game binary.
   The standalone package skips the 2011 regression instead of failing or calling it a pass. The full repository still runs that regression.
 
-Still unsupported for a playable port: calls, branches, untracked memory, LOCK, RSP push/pop, D3D11/DXGI binding, TLS callbacks, exception dispatch, audio, BSA/ESM, and any ARM64 Android run of the game.
+`sub rsp, imm` and selected LEA forms are now in the lifter. They will not make functions with calls or branches runnable. Logical intervals describe the 59 MiB image without allocating it and without copying section bytes. See ROADMAP.md.
+
+Still unsupported for a playable port: calls, branches, untracked memory, indexed LEA, LOCK, RSP push/pop, D3D11/DXGI binding, TLS callbacks, exception dispatch, audio, BSA/ESM, and any ARM64 Android run of the game.

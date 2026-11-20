@@ -93,7 +93,8 @@ def _one(code, start, addr):
             return 16
         return 32
 
-    def finish(mnemonic, cursor, reads, writes, rip=None, mem=None, stack=None, imm=None):
+    def finish(mnemonic, cursor, reads, writes, rip=None, mem=None, stack=None, imm=None,
+               lea_target=None, lea_disp=None):
         size = cursor - start
         insn = {
             "mnemonic": mnemonic,
@@ -109,6 +110,10 @@ def _one(code, start, addr):
             insn["stack"] = stack
         if imm is not None:
             insn["imm"] = imm
+        if lea_target is not None:
+            insn["leaTarget"] = lea_target
+        if lea_disp is not None:
+            insn["leaDisp"] = lea_disp
         return insn, size
 
     if op == 0xC3:
@@ -179,11 +184,30 @@ def _one(code, start, addr):
         _need(code, index + 1, 4)
         return finish("add", index + 5, [(0, bits)], [(0, bits)])
 
-    if op in (0x80, 0x81, 0x83):
+    if op == 0x2D:
+        bits = width()
+        _need(code, index + 1, 4)
+        addend = _sext(int.from_bytes(code[index + 1:index + 5], "little"), 32)
+        return finish("sub", index + 5, [(0, bits)], [(0, bits)], imm=addend)
+    if op == 0x8D:
+        if opsize16:
+            raise Reject("lea_width")
         reg, kind, cursor = _modrm(code, index + 1, addr, start, rex_r, rex_b, rex_x)
-        if kind[0] != "reg" or reg != 0:
-            # Only add-immediate to a register. Other group ops and memory forms
-            # are outside the lifter.
+        bits = 64 if rex_w else 32
+        if kind[0] == "reg" or reg == 4:
+            raise Reject("lea_form")
+        _gpr(reg, bits, rex is not None)
+        if kind[0] == "rip":
+            return finish("lea", cursor, [], [(reg, bits)], lea_target=kind[1])
+        if kind[0] == "rsp":
+            return finish("lea", cursor, [(4, 64)], [(reg, bits)], lea_disp=kind[1])
+        if kind[0] == "base":
+            return finish("lea", cursor, [(kind[1], 64)], [(reg, bits)], lea_disp=kind[2])
+        raise Reject("lea_form")
+    if op in (0x80, 0x81, 0x83):
+        ext, kind, cursor = _modrm(code, index + 1, addr, start, rex_r, rex_b, rex_x)
+        mnemonic = {0: "add", 5: "sub"}.get(ext)
+        if kind[0] != "reg" or mnemonic is None:
             raise Reject("unsupported" if kind[0] == "reg" else "memory_form")
         bits = 8 if op == 0x80 else width()
         if op == 0x83 and bits == 8:
@@ -195,7 +219,7 @@ def _one(code, start, addr):
             addend = _sext(code[cursor], 8)
         else:
             addend = _sext(int.from_bytes(code[cursor:cursor + 4], "little"), 32)
-        return finish("add", cursor + imm_len, [(kind[1], bits)], [(kind[1], bits)], imm=addend)
+        return finish(mnemonic, cursor + imm_len, [(kind[1], bits)], [(kind[1], bits)], imm=addend)
 
     alu = {
         0x01: ("add", "rm"), 0x03: ("add", "reg"),
@@ -239,6 +263,8 @@ def _one(code, start, addr):
             if shape == "rm":
                 return finish(mnemonic, disp_end, [(reg, bits)], [], rip)
             return finish(mnemonic, disp_end, [], [(reg, bits)], rip)
+        if kind[0] in ("base",):
+            raise Reject("memory_form")
         if kind[0] == "rsp":
             if bits != 64:
                 raise Reject("memory_form")
@@ -282,7 +308,10 @@ def _modrm(code, index, addr, start, rex_r, rex_b, rex_x):
         _need(code, index, 1)
         sib = code[index]
         index += 1
-        if rex_x or ((sib >> 3) & 7) != 4 or (sib & 7) != 4:
+        if rex_x or ((sib >> 3) & 7) != 4:
+            raise Reject("memory_form")
+        base_low = sib & 7
+        if mod == 0 and base_low == 5:
             raise Reject("memory_form")
         if mod == 1:
             _need(code, index, 1)
@@ -296,7 +325,10 @@ def _modrm(code, index, addr, start, rex_r, rex_b, rex_x):
             disp = 0
         else:
             raise Reject("memory_form")
-        return reg, ("rsp", disp), index
+        base = base_low + (8 if rex_b else 0)
+        if base == 4:
+            return reg, ("rsp", disp), index
+        return reg, ("base", base, disp), index
     if rex_x:
         raise Reject("memory_form")
     if mod == 0 and rm_low == 5:
@@ -305,4 +337,16 @@ def _modrm(code, index, addr, start, rex_r, rex_b, rex_x):
         index += 4
         next_ip = addr + (index - start)
         return reg, ("rip", next_ip + disp), index
-    raise Reject("memory_form")
+    if mod == 0:
+        disp = 0
+    elif mod == 1:
+        _need(code, index, 1)
+        disp = _sext(code[index], 8)
+        index += 1
+    elif mod == 2:
+        _need(code, index, 4)
+        disp = _s32(code[index:index + 4])
+        index += 4
+    else:
+        raise Reject("memory_form")
+    return reg, ("base", rm_low + (8 if rex_b else 0), disp), index
