@@ -1,0 +1,6 @@
+{
+  "base": 16384,
+  "code_hex": "b8ffffffff",
+  "regs": {"rax": "0xffffffffffffffff", "cf": 1, "zf": 1},
+  "note": "Synthetic mov eax, 0xffffffff. Not game code. rax must become 0x00000000ffffffff and flags stay."
+}
