@@ -25,5 +25,4 @@ android/app/build/
 android/app/.cxx/
 android/local.properties
 tools/__pycache__/
-__pycache__/
 desktop/build/
