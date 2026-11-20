@@ -7,6 +7,7 @@ python3 -B test_leafcheck.py
 python3 -B test_pe32plus_load.py
 python3 -B test_aarch64_qemu.py
 python3 -B test_abi_sandbox.py
+python3 -B test_cfg_sandbox.py
 if [ -f ../lift.py ] && [ -f ../../runtime/main.c ]; then
   python3 -B test_le_regression.py
   echo "LE regression: PASS"

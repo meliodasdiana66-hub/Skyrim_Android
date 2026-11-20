@@ -102,6 +102,27 @@ def _check_window(code, base, mem):
         raise lift64.Unsupported("memory image must be %d bytes" % MEMSZ)
 
 
+def host_source(body):
+    """C program for one snippet. Windows CRT must be binary before any fread."""
+    return (
+        "#define MEMSZ %d\n#include <stdio.h>\n" % MEMSZ
+        + "#ifdef _WIN32\n#include <fcntl.h>\n#include <io.h>\n#endif\n"
+        + "#include \"snippet_rt.h\"\n%s\n" % body
+        + "int main(void) {\n"
+        + "#ifdef _WIN32\n"
+        + "    if (_setmode(_fileno(stdin), _O_BINARY) == -1) return 2;\n"
+        + "    if (_setmode(_fileno(stdout), _O_BINARY) == -1) return 2;\n"
+        + "#endif\n"
+        + "    Cpu64 c; uint8_t mem[MEMSZ];\n"
+        + "    if (fread(&c, sizeof c, 1, stdin) != 1) return 2;\n"
+        + "    if (fread(mem, 1, MEMSZ, stdin) != MEMSZ) return 3;\n"
+        + "    snippet(&c, mem);\n"
+        + "    if (fwrite(&c, sizeof c, 1, stdout) != 1) return 4;\n"
+        + "    if (fwrite(mem, 1, MEMSZ, stdout) != MEMSZ) return 5;\n"
+        + "    return 0;\n}\n"
+    )
+
+
 def binary_for(code, base):
     key = (bytes(code), base)
     if key in _BINS:
@@ -109,16 +130,7 @@ def binary_for(code, base):
     body = lift64.lift_snippet(code, base)
     td = Path(tempfile.mkdtemp(prefix="x64lift-"))
     src = td / "snippet.c"
-    src.write_text(
-        "#define MEMSZ %d\n#include <stdio.h>\n#include \"snippet_rt.h\"\n%s\n"
-        "int main(void) {\n"
-        "    Cpu64 c; uint8_t mem[MEMSZ];\n"
-        "    if (fread(&c, sizeof c, 1, stdin) != 1) return 2;\n"
-        "    if (fread(mem, 1, MEMSZ, stdin) != MEMSZ) return 3;\n"
-        "    snippet(&c, mem);\n"
-        "    if (fwrite(&c, sizeof c, 1, stdout) != 1) return 4;\n"
-        "    if (fwrite(mem, 1, MEMSZ, stdout) != MEMSZ) return 5;\n"
-        "    return 0;\n}\n" % (MEMSZ, body))
+    src.write_text(host_source(body))
     exe = td / "snippet"
     cmd = [os.environ.get("CC", "clang"), "-std=c11", "-O2", "-fwrapv", "-fno-strict-aliasing",
            "-Wall", "-Wextra", "-Werror", "-I", str(HERE), str(src), "-o", str(exe)]

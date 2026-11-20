@@ -13,7 +13,8 @@ A match here means clang `-O2` produced the same registers, defined flags, and m
 | `mov` / `movabs` | reg, imm; reg, reg; reg, mem; mem, reg |
 | `movzx` | reg, reg |
 | `add` | reg, reg; reg, imm |
-| `sub`, `and`, `or`, `xor`, `cmp`, `test` | reg, reg |
+| `sub`, `and`, `or`, `xor`, `cmp` | reg, reg |
+| `test` | reg, reg; reg, imm. The immediate form sets CF, OF, SF, ZF, and PF and does not write the destination. AF stays unchanged |
 | `push` / `pop` | r64 except RSP; `push imm8` and `push imm32` sign-extended to 64. A leaf may use them only inside a proven frame |
 
 Widths are 8, 16, 32, and 64. A 32-bit write zero-extends. An 8- or 16-bit write keeps the upper bits. `R8`–`R15` use the same paths as `RAX`–`RDI`. RIP-relative `mov` uses `insn_end + disp32`. Other memory forms are base register plus a displacement, with no index and no segment.
@@ -80,6 +81,10 @@ A row in `candidates` has `status: candidate_not_executed`. That is not a test r
 
 The Anniversary Edition file was not on the machine that added this tool, so no candidate list for SHA-256 `21a6f8244a57e880d02e600adf61178ab5483db7b3cca8dbfc97d7ca1f081e18` exists here. Windows commands are in `WINDOWS.txt`.
 
+The host harness sets Windows stdin and stdout to binary mode before `fread` and `fwrite`. A local `clang.exe` wrapper that force-includes `_setmode` is not part of this package and should be removed from `PATH`.
+
+`cfg_sandbox.py` is a separate guest, not a wider leaf scanner. It accepts an explicit direct `call rel32` and a forward conditional branch, with step, depth, and trip budgets and an isolated stack. Indirect calls, backward branches, recursion, unknown targets, and missing imports are rejected. `discover_closed` only reports closed graphs; it does not execute them, and a `.pdata` entry is not eligibility. The leaf scanner still rejects `call` and `jcc`.
+
 ## AArch64
 
-`test_aarch64_qemu.py` cross-compiles one lifted `push rax; pop rcx` snippet with `clang --target=aarch64-linux-gnu -nostdinc` and runs that ELF under `qemu-aarch64-static`. That is QEMU user-mode on the build machine. It is not a physical ARM64 device, not Android, and not Adreno. The game executable is not involved. Host C library headers for AArch64 are still absent; the freestanding path defines its own types.
+`test_aarch64_qemu.py` cross-compiles lifted `push`/`pop`, a sign-extending stack store, and `test eax, imm` with `clang --target=aarch64-linux-gnu -nostdinc` and runs those ELFs under `qemu-aarch64-static`. That is QEMU user-mode on the build machine. It is not a physical ARM64 device, not Android, and not Adreno. The game executable is not involved. Host C library headers for AArch64 are still absent; the freestanding path defines its own types.

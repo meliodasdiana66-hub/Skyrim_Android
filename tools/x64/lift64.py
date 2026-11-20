@@ -237,7 +237,7 @@ def _emit(insn):
             if sb != db:
                 raise Unsupported("%s width mismatch at %#x" % (mn, insn.address))
             src_expr = "rd(c, %d, %d)" % (si, sb)
-        elif src.type == x86.X86_OP_IMM and mn in ("add", "sub"):
+        elif src.type == x86.X86_OP_IMM and mn in ("add", "sub", "test"):
             src_expr = "%#xull" % _imm(src, db)
         else:
             raise Unsupported("%s form rejected at %#x" % (mn, insn.address))

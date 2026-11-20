@@ -26,14 +26,18 @@ def _s32(raw):
     return value
 
 
-def decode_stream(code, base):
-    """Decode a straight-line allowlisted snippet. Does not require a final ret."""
+def decode_stream(code, base, control=False):
+    """Decode a straight-line allowlisted snippet. Does not require a final ret.
+
+    control=True is only for the explicit CFG sandbox. The leaf decoder keeps it false,
+    so call and jcc stay rejected there.
+    """
     if not code:
         raise Reject("undecodable")
     index = 0
     out = []
     while index < len(code):
-        insn, size = _one(code, index, base + index)
+        insn, size = _one(code, index, base + index, control=control)
         out.append(insn)
         index += size
     return out
@@ -51,7 +55,10 @@ def decode_leaf(code, base):
     return insns
 
 
-def _one(code, start, addr):
+JCC = ("jo", "jno", "jb", "jae", "je", "jne", "jbe", "ja", "js", "jns", "jp", "jnp", "jl", "jge", "jle", "jg")
+
+
+def _one(code, start, addr, control=False):
     index = start
     rex = None
     opsize16 = False
@@ -94,7 +101,7 @@ def _one(code, start, addr):
         return 32
 
     def finish(mnemonic, cursor, reads, writes, rip=None, mem=None, stack=None, imm=None,
-               lea_target=None, lea_disp=None, xmm=None):
+               lea_target=None, lea_disp=None, xmm=None, branch=None):
         size = cursor - start
         insn = {
             "mnemonic": mnemonic,
@@ -112,6 +119,8 @@ def _one(code, start, addr):
             insn["imm"] = imm
         if lea_target is not None:
             insn["leaTarget"] = lea_target
+        if branch is not None:
+            insn["target"] = branch
         if lea_disp is not None:
             insn["leaDisp"] = lea_disp
         if xmm is not None:
@@ -125,11 +134,38 @@ def _one(code, start, addr):
     if op == 0xC2:
         raise Reject("ret_form")
     if op == 0xE8:
-        raise Reject("call")
-    if op in (0xE9, 0xEB):
-        raise Reject("jump")
+        if not control:
+            raise Reject("call")
+        _need(code, index + 1, 4)
+        rel = _s32(code[index + 1:index + 5])
+        cursor = index + 5
+        return finish("call", cursor, [], [], branch=addr + (cursor - start) + rel)
+    if op == 0xE9:
+        if not control:
+            raise Reject("jump")
+        _need(code, index + 1, 4)
+        rel = _s32(code[index + 1:index + 5])
+        cursor = index + 5
+        return finish("jmp", cursor, [], [], branch=addr + (cursor - start) + rel)
+    if op == 0xEB:
+        if not control:
+            raise Reject("jump")
+        _need(code, index + 1, 1)
+        rel = _sext(code[index + 1], 8)
+        cursor = index + 2
+        return finish("jmp", cursor, [], [], branch=addr + (cursor - start) + rel)
     if 0x70 <= op <= 0x7F:
-        raise Reject("jcc")
+        if not control:
+            raise Reject("jcc")
+        _need(code, index + 1, 1)
+        rel = _sext(code[index + 1], 8)
+        cursor = index + 2
+        return finish(JCC[op - 0x70], cursor, [], [], branch=addr + (cursor - start) + rel)
+    if op == 0xFF:
+        if not control:
+            raise Reject("unsupported")
+        ext, _kind, _cursor = _modrm(code, index + 1, addr, start, rex_r, rex_b, rex_x)
+        raise Reject("indirect_call" if ext == 2 else "indirect_branch")
     if 0x50 <= op <= 0x5F:
         if opsize16:
             raise Reject("push_width")
@@ -157,7 +193,12 @@ def _one(code, start, addr):
         _need(code, index + 1, 1)
         second = code[index + 1]
         if 0x80 <= second <= 0x8F:
-            raise Reject("jcc")
+            if not control:
+                raise Reject("jcc")
+            _need(code, index + 2, 4)
+            rel = _s32(code[index + 2:index + 6])
+            cursor = index + 6
+            return finish(JCC[second - 0x80], cursor, [], [], branch=addr + (cursor - start) + rel)
         if second in (0x28, 0x29):
             xreg, kind, cursor = _modrm(code, index + 2, addr, start, rex_r, rex_b, rex_x)
             if not 0 <= xreg < 16:
@@ -251,6 +292,25 @@ def _one(code, start, addr):
             addend = _sext(int.from_bytes(code[cursor:cursor + 4], "little"), 32)
         return finish(mnemonic, cursor + imm_len, [(kind[1], bits)], [(kind[1], bits)], imm=addend)
 
+    if op == 0xA8:
+        _need(code, index + 1, 1)
+        return finish("test", index + 2, [(0, 8)], [], imm=code[index + 1])
+    if op == 0xA9:
+        bits = width()
+        _need(code, index + 1, 4)
+        raw = int.from_bytes(code[index + 1:index + 5], "little")
+        addend = _sext(raw, 32) if bits == 64 else raw & 0xFFFFFFFF
+        return finish("test", index + 5, [(0, bits)], [], imm=addend)
+    if op == 0xF7:
+        ext, kind, cursor = _modrm(code, index + 1, addr, start, rex_r, rex_b, rex_x)
+        if ext != 0 or kind[0] != "reg":
+            raise Reject("unsupported" if kind[0] == "reg" else "memory_form")
+        bits = width()
+        _gpr(kind[1], bits, rex is not None)
+        _need(code, cursor, 4)
+        raw = int.from_bytes(code[cursor:cursor + 4], "little")
+        addend = _sext(raw, 32) if bits == 64 else raw & 0xFFFFFFFF
+        return finish("test", cursor + 4, [(kind[1], bits)], [], imm=addend)
     alu = {
         0x01: ("add", "rm"), 0x03: ("add", "reg"),
         0x29: ("sub", "rm"), 0x2B: ("sub", "reg"),

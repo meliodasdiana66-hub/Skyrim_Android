@@ -442,6 +442,30 @@ class LiftTests(unittest.TestCase):
             decode_allow.decode_stream(bytes.fromhex("e800000000"), BASE)
         self.assertEqual(caught.exception.reason, "call")
 
+    def test_test_immediate_keeps_dest_and_sets_logic_flags(self):
+        cases = (
+            (bytes.fromhex("a9ff000000c3"), 0, 1, 1, 0),
+            (bytes.fromhex("a9ff000000c3"), 1, 0, 0, 0),
+            (bytes.fromhex("a900000080c3"), 0x80000000, 0, 1, 1),
+        )
+        for code, eax, zf, pf, sf in cases:
+            got, _out = difftest64.run_both(code, BASE, cpu(rax=eax), mem_with(code, BASE), compare_af=False)
+            self.assertEqual(got["r"][0], eax)
+            self.assertEqual((got["zf"], got["pf"], got["sf"], got["cf"], got["of"]), (zf, pf, sf, 0, 0))
+
+    def test_binary_stdio_preserves_ctrl_z_and_crlf(self):
+        src = difftest64.host_source("void snippet(Cpu64 *c, uint8_t *mem) { (void)c; (void)mem; }\n")
+        self.assertLess(src.find("_setmode"), src.find("fread"))
+        self.assertIn("_O_BINARY", src)
+        state = cpu(rax=0x1A0D0A1A)
+        state["xmm"] = [0x1A] + [0] * 15
+        image = mem_with(b"\x90", BASE)
+        image[0x5000:0x5004] = b"\x1a\r\n\x1a"
+        got, out = difftest64.run_both(b"\x90", BASE, state, image)
+        self.assertEqual(got["r"][0], 0x1A0D0A1A)
+        self.assertEqual(got["xmm"][0], 0x1A)
+        self.assertEqual(bytes(out[0x5000:0x5004]), b"\x1a\r\n\x1a")
+
     def test_lock_is_rejected(self):
         code = bytes.fromhex("f0480118")  # lock add qword ptr [rax], rbx
         with self.assertRaises(lift64.Unsupported) as caught:
