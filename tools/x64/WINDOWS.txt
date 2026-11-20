@@ -51,8 +51,12 @@ The command above leaves every import unresolved. --bind-iat is opt-in. It write
 
   pe_data_map --exe "D:\Skyrim Anniversary Edition\SkyrimSE.exe" --expect-sha256 21A6F8244A57E880D02E600ADF61178AB5483DB7B3CCA8DBFC97D7CA1F081E18 --bind-iat
 
-Read-only search for small routines whose only calls are KERNEL32 GetLastError or GetCurrentProcessId. It does not execute a graph and does not call the entry point. eligible may be 0. That count is the result. The JSON has RVAs and counts, not instruction bytes. An unbound IAT qword with bit 63 set is an ordinal flag, not a guest token.
+Read-only search for small routines whose only calls are KERNEL32 GetLastError or GetCurrentProcessId. It does not execute a graph and does not call the entry point. An IAT RVA above the 64 KiB snippet window is iat_oob only when it is outside SizeOfImage. A slot that stays inside one 4 KiB page is not iat_cross_page. Unmodeled, unknown, and ordinal targets are counted separately. eligible may be 0.
 
   py -3 cfg_sandbox.py --exe "D:\Skyrim Anniversary Edition\SkyrimSE.exe" --expect-sha256 21A6F8244A57E880D02E600ADF61178AB5483DB7B3CCA8DBFC97D7CA1F081E18 --iat-discover --report "%USERPROFILE%\skyrimse-iat-discover.json"
+
+--iat-verify is separate. It runs only routines that discover called eligible, with a virtual last_error seed. Unicorn's reference uses a canonical stub and a rewritten IAT cell in that reference image. The lifted path still checks the non-canonical token. It is not a Windows API and it does not call the entry point.
+
+  py -3 cfg_sandbox.py --exe "D:\Skyrim Anniversary Edition\SkyrimSE.exe" --expect-sha256 21A6F8244A57E880D02E600ADF61178AB5483DB7B3CCA8DBFC97D7CA1F081E18 --iat-verify --report "%USERPROFILE%\skyrimse-iat-verify.json"
 
 Exit code 3 means the SHA-256 did not match and nothing was scanned.

@@ -70,6 +70,16 @@ def _plant(buf, slots):
 
 
 class IatLiftTests(unittest.TestCase):
+    def test_image_rva_is_not_a_snippet_window_fault(self):
+        real = 24441520
+        self.assertIsNone(cfg_sandbox.iat_slot_fault(real, 59179008))
+        self.assertEqual(cfg_sandbox.iat_slot_fault(real, cfg_sandbox.MEMSZ), "iat_oob")
+        self.assertEqual(cfg_sandbox.iat_slot_fault(0x1FFC, 59179008), "iat_cross_page")
+        self.assertEqual(cfg_sandbox.iat_slot_fault(0xFFFFFFFFFFFFFFFC, cfg_sandbox.MAX_GUEST), "iat_oob")
+        self.assertEqual(cfg_sandbox.iat_slot_fault(0, cfg_sandbox.MAX_GUEST + 1), "image_limit")
+        self.assertFalse(cfg_sandbox.canonical_user(cfg_sandbox.guest_token(1, 65599)))
+        self.assertTrue(cfg_sandbox.canonical_user(cfg_sandbox.STUB_BASE))
+
     def test_ordinal_flag_is_not_a_token(self):
         self.assertIsNone(cfg_sandbox.token_decode(0x8000000000000007))
         self.assertIsNone(cfg_sandbox.token_decode(0x8000000000000000))
@@ -96,7 +106,11 @@ class IatLiftTests(unittest.TestCase):
         self.assertEqual(result["probe"], second_return)
         self.assertEqual(result["slots"][IAT_SET], cfg_sandbox.guest_token(1, 1))
         self.assertFalse(result["entryPointExecuted"])
-        self.assertEqual(result["oracle"], "unicorn-stub-at-token-address")
+        self.assertEqual(result["oracle"], "unicorn-canonical-stub")
+        self.assertFalse(cfg_sandbox.canonical_user(result["slots"][IAT_SET]))
+        self.assertTrue(cfg_sandbox.canonical_user(cfg_sandbox.STUB_BASE))
+        self.assertFalse(cfg_sandbox.canonical_user(result["slots"][IAT_SET]))
+        self.assertTrue(cfg_sandbox.canonical_user(cfg_sandbox.STUB_BASE))
 
     def test_negative_calls_do_not_invent_a_return(self):
         slots = _slots()
@@ -236,6 +250,71 @@ class IatLiftTests(unittest.TestCase):
             self.assertEqual(found["obstacles"].get("iat_unmodeled"), 1)
             text = json.dumps(found)
             self.assertNotRegex(text, r"\"[0-9a-fA-F]{16,}\"")
+
+
+class HighIatDiscoveryTests(unittest.TestCase):
+    def test_high_rva_is_classified_and_a_clean_call_verifies(self):
+        iat = 0x1750100
+        code = bytes.fromhex("4883ec28")
+        code += b"\xff\x15" + struct.pack("<i", iat - (0x1000 + len(code) + 6))
+        code += bytes.fromhex("4883c428c3")
+        others = {
+            0x1040: (0x1750108, "unmodeled"),
+            0x1060: (0x1750110, "ordinal"),
+            0x1080: (0x1750180, "unknown"),
+            0x10A0: (0x1750FFC, "cross"),
+        }
+        blob = bytearray(0x900)
+        blob[0:2] = b"MZ"
+        struct.pack_into("<I", blob, 0x3C, 0x80)
+        blob[0x80:0x84] = b"PE\0\0"
+        struct.pack_into("<HH", blob, 0x84, 0x8664, 3)
+        struct.pack_into("<H", blob, 0x94, 0xF0)
+        struct.pack_into("<H", blob, 0x98, 0x20B)
+        struct.pack_into("<I", blob, 0x98 + 16, 0x1F00)
+        struct.pack_into("<Q", blob, 0x98 + 24, 0x140000000)
+        struct.pack_into("<I", blob, 0x98 + 56, 0x1761000)
+        struct.pack_into("<I", blob, 0x98 + 108, 16)
+        struct.pack_into("<II", blob, 0x98 + 120, 0x1750000, 40)
+        struct.pack_into("<II", blob, 0x98 + 136, 0x3000, 60)
+        blob[0x188:0x18D] = b".text"
+        struct.pack_into("<IIIIII", blob, 0x188 + 8, 0x1000, 0x1000, 0x200, 0x200, 0, 0)
+        struct.pack_into("<I", blob, 0x188 + 36, 0x60000020)
+        blob[0x1B0:0x1B5] = b".data"
+        struct.pack_into("<IIIIII", blob, 0x1B0 + 8, 0x1100, 0x1750000, 0x200, 0x400, 0, 0)
+        struct.pack_into("<I", blob, 0x1B0 + 36, 0x40000040)
+        blob[0x1D8:0x1DE] = b".pdata"
+        struct.pack_into("<IIIIII", blob, 0x1D8 + 8, 0x100, 0x3000, 0x100, 0x600, 0, 0)
+        struct.pack_into("<I", blob, 0x1D8 + 36, 0x40000040)
+        blob[0x200:0x200 + len(code)] = code
+        for addr, (target, _kind) in others.items():
+            insn = b"\xff\x15" + struct.pack("<i", target - (addr + 6)) + b"\xc3"
+            blob[0x200 + (addr - 0x1000):0x200 + (addr - 0x1000) + len(insn)] = insn
+        struct.pack_into("<IIIII", blob, 0x400, 0x1750040, 0, 0, 0x1750080, 0x1750100)
+        struct.pack_into("<Q", blob, 0x440, 0x1750120)
+        struct.pack_into("<Q", blob, 0x448, 0x1750140)
+        struct.pack_into("<Q", blob, 0x450, 0x8000000000000007)
+        blob[0x480:0x48D] = b"KERNEL32.dll"
+        blob[0x522:0x522 + 13] = b"GetLastError"
+        blob[0x542:0x542 + 12] = b"ExitProcess"
+        pdata = [(0x1000, 0x1000 + len(code))]
+        pdata += [(addr, addr + 7) for addr in others]
+        for index, (begin, end) in enumerate(pdata):
+            struct.pack_into("<III", blob, 0x600 + index * 12, begin, end, 0)
+        found = cfg_sandbox.discover_modeled_iat(bytes(blob))
+        self.assertFalse(found["executed"])
+        self.assertEqual(found["eligibleEntries"], [0x1000])
+        self.assertEqual(found["obstacles"].get("iat_unmodeled"), 1)
+        self.assertEqual(found["obstacles"].get("iat_ordinal"), 1)
+        self.assertEqual(found["obstacles"].get("unknown_iat"), 1)
+        self.assertEqual(found["obstacles"].get("iat_cross_page"), 1)
+        self.assertNotIn("iat_oob", found["obstacles"])
+        verified = cfg_sandbox.verify_modeled_iat(bytes(blob), last_seed=0x55)
+        self.assertTrue(verified["verifyExecuted"])
+        self.assertFalse(verified["entryPointExecuted"])
+        self.assertEqual(verified["verified"][0]["rax"], 0x55)
+        self.assertEqual(verified["verified"][0]["oracle"], "unicorn-canonical-stub")
+        self.assertEqual(verified["verified"][0]["rbx"], 0xA11CE)
 
 
 if __name__ == "__main__":

@@ -59,9 +59,35 @@ class CfgError(Exception):
         self.detail = detail or {}
 
 
+MAX_GUEST = 64 * 1024 * 1024
+# Canonical user address. Bit 63 tokens are not fetchable on every Unicorn build.
+STUB_BASE = 0x7FFF00000000
+STUB_STRIDE = 32
+
+
+def canonical_user(addr):
+    """x86-64 user pointer: bits 63:47 are all zero. A token fails this on purpose."""
+    return 0 <= addr <= 0xFFFFFFFFFFFFFFFF and (addr >> 47) == 0
+
+
 def guest_token(kind, thunk_id):
     """Same bits as ae_guest_token. The high bit alone is not enough."""
     return 0x8000000000000000 | ((kind & 0xF) << 36) | ((thunk_id & 0x0FFFFFFF) << 4)
+
+
+def iat_slot_fault(addr, limit):
+    """Image-sized slot check. MEMSZ is not a page boundary and not the image."""
+    if not isinstance(limit, int) or limit < 0 or limit > MAX_GUEST:
+        return "image_limit"
+    if not isinstance(addr, int) or addr < 0 or addr > 0xFFFFFFFFFFFFFFFF - 8:
+        return "iat_oob"
+    if (addr >> 12) != ((addr + 7) >> 12):
+        return "iat_cross_page"
+    if addr & 7:
+        return "iat_misaligned"
+    if addr + 8 > limit:
+        return "iat_oob"
+    return None
 
 
 def token_decode(token):
@@ -123,16 +149,16 @@ def _acyclic(graph):
             walk(node)
 
 
-def _check_iat_addr(addr, slots):
+def _check_iat_addr(addr, slots, limit):
     if addr not in slots:
         raise CfgError("unknown_iat")
-    if addr < 0 or addr + 8 > MEMSZ:
-        raise CfgError("iat_oob")
-    if addr & 7 or (addr >> 12) != ((addr + 7) >> 12):
-        raise CfgError("iat_cross_page")
+    fault = iat_slot_fault(addr, limit)
+    if fault:
+        raise CfgError(fault)
 
 
-def prepare(funcs, entry, imports=None, max_steps=MAX_STEPS_DEFAULT, iat_slots=None):
+def prepare(funcs, entry, imports=None, max_steps=MAX_STEPS_DEFAULT, iat_slots=None,
+            image_limit=None):
     """Validate an explicit function map. Does not execute it."""
     if not funcs or entry not in funcs:
         raise CfgError("unknown_target")
@@ -146,7 +172,7 @@ def prepare(funcs, entry, imports=None, max_steps=MAX_STEPS_DEFAULT, iat_slots=N
         insns = _decode(code, base, allow_iat=iat_slots is not None)
         for insn in insns:
             if insn["mnemonic"] == "call_rip":
-                _check_iat_addr(insn["iat"], iat_slots)
+                _check_iat_addr(insn["iat"], iat_slots, MEMSZ if image_limit is None else image_limit)
         calls = _edges(insns, base, len(code))
         for target in calls:
             if target in imports:
@@ -279,7 +305,11 @@ def _emit_function(base, code, insns, max_steps, max_depth, iat_slots=None, last
     return "\n".join(helpers + lines)
 
 
-def _iat_helper(last_addr, pid):
+def _iat_helper(last_addr, pid, external=None):
+    rows = []
+    for addr, token in sorted((external or {}).items()):
+        rows.append("        else if (slot == %dull) token = %dull;" % (addr, token))
+    external_c = "\n".join(rows)
     return """
 static int ae_iat_call(Cpu64 *c, uint8_t *mem, uint64_t slot, unsigned expect_id, int api,
                        int max_depth, int max_steps, uint64_t ret_ip, uint64_t last_addr, uint64_t pid) {
@@ -287,12 +317,16 @@ static int ae_iat_call(Cpu64 *c, uint8_t *mem, uint64_t slot, unsigned expect_id
     uint64_t token, kind, id, rebuilt;
     if ((rsp & 15ull) != 0ull) { stop = 12; return 12; }
     if (rsp < %dull || rsp + 0x20ull > %dull) { stop = 14; return 14; }
-    if ((slot & 7ull) || ((slot >> 12) != ((slot + 7ull) >> 12)) || slot + 8ull > (uint64_t)MEMSZ) {
+    if ((slot & 7ull) || slot + 8ull < slot || ((slot >> 12) != ((slot + 7ull) >> 12))) {
         stop = 16; return 16;
     }
     if (++depth > max_depth) { stop = 11; return 11; }
     if (++steps > max_steps) { depth--; stop = 9; return 9; }
-    token = ld(mem, slot, 8);
+    token = ~0ull;
+    if (slot + 8ull <= (uint64_t)MEMSZ) token = ld(mem, slot, 8);
+    else if (0) token = 0;
+%s
+    if (token == ~0ull) { depth--; stop = 16; return 16; }
     kind = (token >> 36) & 0xfull;
     id = (token >> 4) & 0x0fffffffull;
     rebuilt = 0x8000000000000000ull | (kind << 36) | (id << 4);
@@ -311,12 +345,14 @@ static int ae_iat_call(Cpu64 *c, uint8_t *mem, uint64_t slot, unsigned expect_id
     depth--;
     return 0;
 }
-""" % (STACK_LO + 8, STACK_TOP)
+""" % (STACK_LO + 8, STACK_TOP, external_c)
 
 
 def emit_program(funcs, entry, imports=None, max_steps=MAX_STEPS_DEFAULT, max_depth=MAX_DEPTH_DEFAULT,
-                  freestanding=False, iat_slots=None, last_addr=0, pid=0, report_stop=False):
-    prepared = prepare(funcs, entry, imports=imports, max_steps=max_steps, iat_slots=iat_slots)
+                  freestanding=False, iat_slots=None, last_addr=0, pid=0, report_stop=False,
+                  image_limit=None, external=None):
+    prepared = prepare(funcs, entry, imports=imports, max_steps=max_steps, iat_slots=iat_slots,
+                       image_limit=image_limit)
     uses_depth = any(
         insn["mnemonic"] in ("call", "call_rip")
         for base in prepared["reachable"]
@@ -333,7 +369,7 @@ def emit_program(funcs, entry, imports=None, max_steps=MAX_STEPS_DEFAULT, max_de
         parts.append("static int depth;")
     parts.append("static int stop;")
     if iat_slots is not None:
-        parts.append(_iat_helper(last_addr, pid))
+        parts.append(_iat_helper(last_addr, pid, external))
     for base in prepared["reachable"]:
         parts.append("void %s(Cpu64 *c, uint8_t *mem);" % _c_name(base))
     for base in prepared["reachable"]:
@@ -483,24 +519,60 @@ def virtual_api(name, ecx, last, pid, rax):
     return None
 
 
+def _stub_bytes(name, last_addr, pid):
+    if name == "GetLastError":
+        return b"\x48\xa1" + struct.pack("<Q", last_addr) + b"\xc3"
+    if name == "GetCurrentProcessId":
+        return b"\xb8" + struct.pack("<I", pid & 0xFFFFFFFF) + b"\xc3"
+    if name == "SetLastError":
+        return b"\x89\x0c\x25" + struct.pack("<I", last_addr & 0xFFFFFFFF) + b"\xc3"
+    raise CfgError("unimplemented_import")
+
+
+def _production_token(slot):
+    kind = 1 if slot.get("modeled") else 2
+    token = slot.get("token", guest_token(kind, slot["id"]))
+    decoded = token_decode(token)
+    if decoded != (kind, slot["id"]) or canonical_user(token):
+        raise CfgError("illegal_token")
+    return token
+
+
 def execute_iat(funcs, entry, cpu, mem, return_ip, iat_slots, last_addr, pid,
-                max_steps=MAX_STEPS_DEFAULT, max_depth=MAX_DEPTH_DEFAULT, probe=None):
+                max_steps=MAX_STEPS_DEFAULT, max_depth=MAX_DEPTH_DEFAULT, probe=None,
+                image_limit=None):
     """Lift call [rip+disp32] through a registered guest token.
 
-    Unicorn cannot interpret a token. For a successful call it fetches a
-    reference stub planted at that guest address. The lifter never reads
-    those stub bytes. Failures are decided by the lifter before the push, so
-    they are not compared with Unicorn.
+    The lifter reads the production token and never fetches it. Unicorn gets
+    a separate reference image: each modeled IAT cell is rewritten to a
+    canonical stub address. Instruction bytes are not rewritten. Failures are
+    decided by the lifter before the push, so they are not compared.
     """
+    limit = MEMSZ if image_limit is None else image_limit
+    if iat_slot_fault(0, limit) == "image_limit":
+        raise CfgError("image_limit")
     _check_stack(cpu, mem, return_ip)
     image = bytearray(mem)
+    external = {}
     for base, code in funcs.items():
-        if base < 0 or base + len(code) > MEMSZ or (STACK_LO <= base < STACK_TOP + 8):
+        if base < MEMSZ < base + len(code) or (base & ~0xFFF) != ((base + len(code) - 1) & ~0xFFF):
+            raise CfgError("span_limit")
+        high = base >= MEMSZ
+        if high and image_limit is None:
             raise CfgError("code_window")
-        image[base:base + len(code)] = code
+        if STACK_LO <= base < STACK_TOP + 8:
+            raise CfgError("code_window")
+        if not high:
+            image[base:base + len(code)] = code
+    for addr, slot in iat_slots.items():
+        if addr + 8 <= MEMSZ:
+            continue
+        if image_limit is None:
+            raise CfgError("iat_oob")
+        external[addr] = _production_token(slot)
     source, prepared = emit_program(
         funcs, entry, iat_slots=iat_slots, max_steps=max_steps, max_depth=max_depth,
-        last_addr=last_addr, pid=pid, report_stop=True)
+        last_addr=last_addr, pid=pid, report_stop=True, image_limit=limit, external=external)
     td = Path(tempfile.mkdtemp(prefix="x64iat-"))
     src = td / "cfg.c"
     exe = td / "cfg"
@@ -529,25 +601,37 @@ def execute_iat(funcs, entry, cpu, mem, return_ip, iat_slots, last_addr, pid,
         })
     uc = Uc(UC_ARCH_X86, UC_MODE_64)
     uc.mem_map(0, MEMSZ)
-    uc.mem_write(0, bytes(image))
-    # Unicorn fetches the token as a guest address. The bytes there are a
-    # reference stub, not the lifter's path and not a host function.
-    mapped_pages = set()
-    for slot in iat_slots.values():
+    reference = bytearray(image)
+    stubs = {}
+    for index, addr in enumerate(sorted(iat_slots)):
+        slot = iat_slots[addr]
         if not slot.get("modeled") or slot["name"] not in _MODELED_APIS:
             continue
-        token = guest_token(1, slot["id"])
-        page = token & ~0xFFF
-        if page not in mapped_pages:
+        stub = STUB_BASE + index * STUB_STRIDE
+        if not canonical_user(stub) or stub + len(_stub_bytes(slot["name"], last_addr, pid)) > STUB_BASE + 0x1000:
+            raise CfgError("stub_window")
+        if addr + 8 <= MEMSZ:
+            reference[addr:addr + 8] = struct.pack("<Q", stub)
+        stubs[stub] = (addr, _stub_bytes(slot["name"], last_addr, pid))
+    uc.mem_write(0, bytes(reference))
+    if stubs:
+        uc.mem_map(STUB_BASE, 0x1000)
+        for stub, (_addr, blob) in stubs.items():
+            uc.mem_write(stub, blob)
+    mapped = {0}
+    for base, code in funcs.items():
+        if base >= MEMSZ:
+            page = base & ~0xFFF
+            if page not in mapped:
+                uc.mem_map(page, 0x1000)
+                mapped.add(page)
+            uc.mem_write(base, code)
+    for addr in external:
+        page = addr & ~0xFFF
+        if page not in mapped:
             uc.mem_map(page, 0x1000)
-            mapped_pages.add(page)
-        if slot["name"] == "GetLastError":
-            stub = b"\x48\xa1" + struct.pack("<Q", last_addr) + b"\xc3"
-        elif slot["name"] == "GetCurrentProcessId":
-            stub = b"\xb8" + struct.pack("<I", pid & 0xFFFFFFFF) + b"\xc3"
-        else:
-            stub = b"\x89\x0c\x25" + struct.pack("<I", last_addr) + b"\xc3"
-        uc.mem_write(token, stub)
+            mapped.add(page)
+        uc.mem_write(addr, struct.pack("<Q", next(stub for stub, (slot_addr, _blob) in stubs.items() if slot_addr == addr)))
     for reg, value in zip(UC_GPRS, cpu["r"]):
         uc.reg_write(reg, int(value) & 0xFFFFFFFFFFFFFFFF)
     uc.reg_write(UC_X86_REG_EFLAGS, difftest64._flags_to_eflags(cpu))
@@ -559,11 +643,22 @@ def execute_iat(funcs, entry, cpu, mem, return_ip, iat_slots, last_addr, pid,
     names = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
              "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
     diffs = [name for index, name in enumerate(names) if host_cpu["r"][index] != uni[index]]
-    uni_mem = bytes(uc.mem_read(0, MEMSZ))
-    if host_mem != uni_mem:
+    uni_mem = bytearray(uc.mem_read(0, MEMSZ))
+    host_view = bytearray(host_mem)
+    for addr in iat_slots:
+        if addr + 8 <= MEMSZ:
+            host_view[addr:addr + 8] = b"\x00" * 8
+            uni_mem[addr:addr + 8] = b"\x00" * 8
+    if host_view != uni_mem:
         diffs.append("mem")
     if diffs:
         raise AssertionError("cfg mismatch: " + ",".join(diffs))
+    observed = {}
+    for addr in iat_slots:
+        if addr + 8 <= MEMSZ:
+            observed[addr] = int.from_bytes(host_mem[addr:addr + 8], "little")
+        else:
+            observed[addr] = external[addr]
     return {
         "executed": True,
         "rax": host_cpu["r"][0],
@@ -571,9 +666,9 @@ def execute_iat(funcs, entry, cpu, mem, return_ip, iat_slots, last_addr, pid,
         "rsp": host_cpu["r"][4],
         "lastError": int.from_bytes(host_mem[last_addr:last_addr + 4], "little"),
         "entryPointExecuted": False,
-        "oracle": "unicorn-stub-at-token-address",
+        "oracle": "unicorn-canonical-stub",
         "reached": prepared["reachable"],
-        "slots": {addr: int.from_bytes(host_mem[addr:addr + 8], "little") for addr in iat_slots},
+        "slots": observed,
         "probe": None if probe is None else int.from_bytes(host_mem[probe:probe + 8], "little"),
     }
 
@@ -1426,6 +1521,7 @@ def _import_slots(data, info):
         thunk_rva = oft or first
         iat_rva = first or oft
         step = 0
+        dll_index = index
         while step < 4096:
             try:
                 toff = inspect_pe32plus.file_offset_for_rva(sections, thunk_rva + step * 8, 8)
@@ -1438,7 +1534,10 @@ def _import_slots(data, info):
             name = None if ordinal else _slot_name(data, sections, value)
             modeled = (not ordinal and dll.lower() == "kernel32.dll" and
                        name in ("GetLastError", "GetCurrentProcessId"))
-            slots[iat_rva + step * 8] = {"dll": dll, "name": name, "ordinal": ordinal, "modeled": modeled}
+            slots[iat_rva + step * 8] = {
+                "dll": dll, "name": name, "ordinal": ordinal, "modeled": modeled,
+                "id": (dll_index << 16) | step,
+            }
             step += 1
         index += 1
     return slots
@@ -1459,7 +1558,13 @@ def discover_modeled_iat(data):
         "obstacles": {},
         "modeledSlots": sum(1 for slot in slots.values() if slot["modeled"]),
         "ordinalSlots": sum(1 for slot in slots.values() if slot["ordinal"]),
+        "imageSize": info["sizeOfImage"],
+        "callRip": 0,
     }
+    image_size = info["sizeOfImage"]
+    if not isinstance(image_size, int) or image_size <= 0 or image_size > MAX_GUEST:
+        report["obstacles"] = {"image_limit": 1}
+        return report
     exc = info["exceptionDirectory"]
     if not exc["present"] or exc["size"] < 12:
         report["obstacles"] = {"no_exception_directory": 1}
@@ -1496,29 +1601,39 @@ def discover_modeled_iat(data):
         if not any(insn["mnemonic"] == "call_rip" for insn in insns):
             continue
         report["withRipCall"] += 1
+        rank = {
+            "iat_oob": 0, "iat_misaligned": 1, "iat_cross_page": 2, "unknown_iat": 3,
+            "iat_ordinal": 4, "iat_unmodeled": 5, "direct_call": 6, "memory_or_global": 7,
+            "missing_ret": 8,
+        }
         reason = None
         for insn in insns:
             if insn["mnemonic"] == "call_rip":
+                report["callRip"] += 1
                 addr = insn["iat"]
-                if addr < 0 or addr + 8 > MEMSZ or addr & 7 or (addr >> 12) != ((addr + 7) >> 12):
-                    reason = "iat_cross_page"
-                    break
-                slot = slots.get(addr)
-                if slot is None:
-                    reason = "unknown_iat"
-                    break
-                if not slot["modeled"]:
-                    reason = "iat_unmodeled"
-                    break
+                fault = iat_slot_fault(addr, image_size)
+                if fault:
+                    candidate = fault
+                else:
+                    slot = slots.get(addr)
+                    if slot is None:
+                        candidate = "unknown_iat"
+                    elif slot["ordinal"]:
+                        candidate = "iat_ordinal"
+                    elif not slot["modeled"]:
+                        candidate = "iat_unmodeled"
+                    else:
+                        candidate = None
             elif insn["mnemonic"] == "call":
-                reason = "direct_call"
-                break
+                candidate = "direct_call"
             elif insn["mnemonic"] not in ("mov", "sub", "add", "ret") or insn.get("mem") or insn.get("rip"):
-                reason = "memory_or_global"
-                break
+                candidate = "memory_or_global"
             elif insn["mnemonic"] in ("sub", "add") and not any(index == 4 for index, _bits in insn["writes"]):
-                reason = "memory_or_global"
-                break
+                candidate = "memory_or_global"
+            else:
+                candidate = None
+            if candidate is not None and (reason is None or rank[candidate] < rank[reason]):
+                reason = candidate
         if reason is None and (not insns or insns[-1]["mnemonic"] != "ret"):
             reason = "missing_ret"
         if reason is None:
@@ -1530,8 +1645,69 @@ def discover_modeled_iat(data):
     report["note"] = (
         "Read-only. No graph was executed and the entry point was not called. "
         "eligibleEntries are RVAs of routines whose only calls are "
-        "KERNEL32 GetLastError or GetCurrentProcessId. Counts do not include instruction bytes."
+        "KERNEL32 GetLastError or GetCurrentProcessId. An IAT RVA above the "
+        "64 KiB snippet window is not a page crossing. Counts do not include instruction bytes."
     )
+    return report
+
+
+def verify_modeled_iat(data, last_seed=0x55, pid=0xABCD, max_entries=1):
+    """Run eligible routines only. The default discover path does not call this."""
+    report = discover_modeled_iat(data)
+    report["verified"] = []
+    report["verifyExecuted"] = False
+    if max_entries < 0:
+        raise CfgError("image_limit")
+    if not report["eligibleEntries"]:
+        return report
+    info = inspect_pe32plus.inspect_bytes(data)
+    slots = _import_slots(data, info)
+    exc = info["exceptionDirectory"]
+    off = inspect_pe32plus.file_offset_for_rva(info["sections"], exc["virtualAddress"], exc["size"])
+    blob = data[off:off + exc["size"]]
+    wanted = set(report["eligibleEntries"][:max_entries])
+    for n in range(len(blob) // 12):
+        begin = int.from_bytes(blob[n * 12:n * 12 + 4], "little")
+        end = int.from_bytes(blob[n * 12 + 4:n * 12 + 8], "little")
+        if begin not in wanted:
+            continue
+        raw_at = inspect_pe32plus.file_offset_for_rva(info["sections"], begin, end - begin)
+        code = bytes(data[raw_at:raw_at + (end - begin)])
+        insns = decode_allow.decode_stream(code, begin, control=True)
+        used = {}
+        for insn in insns:
+            if insn["mnemonic"] != "call_rip":
+                continue
+            slot = dict(slots[insn["iat"]])
+            slot["token"] = guest_token(1, slot["id"])
+            used[insn["iat"]] = slot
+        mem = bytearray(MEMSZ)
+        mem[STACK_TOP:STACK_TOP + 8] = struct.pack("<Q", DONE)
+        mem[0x2200:0x2204] = struct.pack("<I", last_seed & 0xFFFFFFFF)
+        cpu = {"r": [0] * 16, "cf": 0, "pf": 0, "af": 0, "zf": 0, "sf": 0, "of": 0}
+        cpu["r"][3] = 0xA11CE
+        cpu["r"][4] = STACK_TOP
+        for addr, slot in used.items():
+            if addr + 8 <= MEMSZ:
+                mem[addr:addr + 8] = struct.pack("<Q", slot["token"])
+        result = execute_iat(
+            {begin: code}, begin, cpu, mem, DONE, used, 0x2200, pid,
+            image_limit=info["sizeOfImage"])
+        rax, last = 0, last_seed & 0xFFFFFFFF
+        for insn in insns:
+            if insn["mnemonic"] == "call_rip":
+                rax, last = virtual_api(used[insn["iat"]]["name"], 0, last, pid, rax)
+        if rax is None or result["rax"] != rax or result["lastError"] != last:
+            raise CfgError("virtual_api_mismatch")
+        report["verified"].append({
+            "entry": begin,
+            "rax": result["rax"],
+            "lastError": result["lastError"],
+            "rbx": result["rbx"],
+            "oracle": result["oracle"],
+            "entryPointExecuted": False,
+        })
+        report["verifyExecuted"] = True
     return report
 
 
@@ -1557,6 +1733,8 @@ def main(argv=None):
                         help="metadata-only rejection report; does not execute any graph")
     parser.add_argument("--iat-discover", action="store_true",
                         help="count routines that only call modeled IAT slots; does not execute")
+    parser.add_argument("--iat-verify", action="store_true",
+                        help="run only the eligible modeled-IAT routines against the virtual API")
     parser.add_argument("--max-graphs", type=int, default=8)
     parser.add_argument("--max-functions", type=int, default=8)
     parser.add_argument("--max-instructions", type=int, default=64)
@@ -1575,11 +1753,14 @@ def main(argv=None):
     if digest.lower() != args.expect_sha256.lower():
         print("sha256 mismatch", file=sys.stderr)
         return 3
-    if sum(bool(flag) for flag in (args.execute, args.diagnose, args.iat_discover)) > 1:
-        print("choose only one of --execute, --diagnose, and --iat-discover", file=sys.stderr)
+    chosen = (args.execute, args.diagnose, args.iat_discover, args.iat_verify)
+    if sum(bool(flag) for flag in chosen) > 1:
+        print("choose only one of --execute, --diagnose, --iat-discover, and --iat-verify", file=sys.stderr)
         return 2
     try:
-        if args.iat_discover:
+        if args.iat_verify:
+            report = verify_modeled_iat(data)
+        elif args.iat_discover:
             report = discover_modeled_iat(data)
         elif args.diagnose:
             report = diagnose_image(
@@ -1597,7 +1778,7 @@ def main(argv=None):
         print("pe: %s" % exc, file=sys.stderr)
         return 2
     report["sha256"] = digest
-    if args.iat_discover:
+    if args.iat_discover or args.iat_verify:
         pass
     elif args.diagnose:
         report["note"] = (
