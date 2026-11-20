@@ -37,4 +37,8 @@ This revision adds metadata on that rejection: RVA, operand category, width, reg
 
 `tools/x64/guest_mem.c` maps sparse data pages, zero-fills past the file bytes, checks permissions, and applies DIR64. EXECUTE is refused. A logical execute flag is not a host executable mapping. It does not call guest code or imports.
 
-Still unsupported for a playable port: the real closed graph until a declared contract exists for whatever it touches, indirect calls, backward branches, untracked memory, indexed LEA, LOCK, RSP push/pop, segment overrides, D3D11/DXGI binding, TLS callbacks, exception dispatch, audio, BSA/ESM, and any ARM64 Android run of the game.
+Run 9 diagnose, archive f084c149…, same SHA-256: the 38+52 graph was not executed. Reason argument_contract_missing. The store is 8 bytes through RCX, role integer_argument_0, provenance incoming_unspecified, RVA 4271587, callee 4271568, caller 4272192. It is not lost_after_call and not dangling. No object contract was supplied. Standalone tests on Windows: proto 32, leaf 9, pe 5, abi 2, cfg 11, guest_mem 1.
+
+This revision makes guest_map and guest_apply_dir64 transactional: a failed allocation or a later unmapped or read-only DIR64 target leaves prior bytes unchanged. Permissions are per span, so two sections can share a page without widening write or logical execute. pe_data_map reads the EXE read-only, maps data pages, prints metadata, and does not call the entry or bind imports. The 64 MiB cap covers SizeOfImage 59179008. The real graph is still blocked. See ROADMAP.md.
+
+Still unsupported for a playable port: a declared contract for that RCX pointer, indirect calls, backward branches, untracked memory, indexed LEA, LOCK, RSP push/pop, segment overrides, D3D11/DXGI binding, TLS callbacks, exception dispatch, audio, BSA/ESM, and any ARM64 Android run of the game.

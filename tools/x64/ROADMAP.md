@@ -10,12 +10,15 @@ This is not a playable port. The 2011 pipeline is unchanged. Nothing here calls 
 - `lea r64/r32, [base+disp]`, `[rsp+disp]`, and `[rip+disp]` without a memory read. Indexed LEA stays rejected.
 - Logical RVA intervals for the 59 MiB `SizeOfImage`: file-backed, zero-fill, unmapped gaps, section permissions. No guest allocation and no copy of section bytes. Dense `map_synthetic` is still capped at 1 MiB. Imports, TLS callbacks, unwind, and the entry point are recorded as not run.
 
-## Not done, in order
+## Critical path
 
-1. `mov [rsp+disp], imm/reg` at 8/16/32/64 bits and `movaps` with a 16-byte alignment check are in the lifter. A pointer is dereferenced only when this leaf computed it from the frame. Incoming argument registers are not a sandbox. Game leaves that contain `call` stay rejected.
-2. A synthetic caller/callee sum is checked against Unicorn and, when QEMU is present, the same C model on AArch64. It does not call a Windows import. The leaf scanner still rejects `call`.
-3. Run 8 assessed the only real closed graph (38+52 bytes, one direct call) and rejected it as `sandbox_untracked`. Zero graphs and zero cases ran. That rejection stands. `--diagnose` reports the RVA, width, register role, and whether the pointer is an incoming argument or stack provenance that a call dropped. It does not execute. A synthetic argument object is a declared test input with an explicit size; the access width is not turned into a layout, and it is not the game's memory. `guest_mem.c` is a sparse data map with checked reads, writes, zero-fill, and DIR64. It does not create an executable host page and does not call x64 code. `call [reg]`, `call [rip]`, backward branches, and `and reg, imm` stay unsupported.
-4. Bind non-graphics imports (`kernel32` file/heap/thread) to the existing host shims. The EXE entry point stays uncalled.
-5. D3D11/Vulkan and Android packaging come after a translated call works. The launcher UI waits on that.
+Mapping data is not execution. There is no APK and no claim that the game runs.
+
+1. **Runtime.** `guest_mem` holds sparse data pages. A failed map or DIR64 application leaves the previous bytes unchanged. Spans on one page keep their own read/write flags, so a writable neighbor does not widen a read-only span, and logical execute is not a host-executable page. `pe_data_map` reads a PE32+ file in place, maps sections and zero-fill, records imports as unresolved, and does not call the entry point. The cap is 64 MiB, which covers the 59 MiB image and refuses a hostile `SizeOfImage`.
+2. **Translation.** Run 9 diagnosed the only closed graph and did not execute it. The callee at RVA 4271568 stores 8 bytes through incoming `RCX` at RVA 4271587. The caller is RVA 4272192. Provenance is `incoming_unspecified`, not a lost or dangling stack pointer. The 8-byte width is not an object layout, and no contract was invented. That graph stays blocked until a real caller analysis supplies size, readable, writable, and initial bytes.
+3. **ABI and imports.** Import names are inventoried and left unresolved. Binding `kernel32` file, heap, and thread comes after a translated call, and still does not call the EXE entry.
+4. **Renderer.** D3D11/Vulkan and Android packaging wait on that call. The launcher UI waits with them.
+
+`call [reg]`, `call [rip]`, backward branches, and `and reg, imm` stay unsupported.
 
 `sub rsp` will not by itself turn the 83,790 prologue rejects into running functions. Most of those functions also contain a call or a branch.

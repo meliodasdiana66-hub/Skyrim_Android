@@ -1,8 +1,13 @@
 /* Sparse guest data pages for the AE prototype.
 
-   This is not a loader. It never creates an executable host mapping, never
-   calls guest code, and never binds an import. EXECUTE is refused.
-   A logical execute bit may be recorded for a PE section and is only a flag.
+   Pages are host data allocations. GUEST_PERM_EXECUTE is refused and
+   guest_host_executable is always 0. A logical execute flag is per mapped
+   span, not a host mapping and not a permission to write.
+
+   Permissions belong to address spans. Two sections may share a 4 KiB page
+   and keep different read/write flags; a writable neighbor does not widen a
+   read-only span. guest_map and guest_apply_dir64 either commit completely
+   or leave the previous bytes and spans unchanged.
 */
 #ifndef X64_GUEST_MEM_H
 #define X64_GUEST_MEM_H
@@ -26,18 +31,24 @@ enum {
     GUEST_ERR_NOMEM = 6
 };
 
+/* 64 MiB of 4 KiB pages. The 59 MiB Skyrim image fits. Larger requests fail. */
+enum { GUEST_PAGE_SIZE = 4096, GUEST_MAX_PAGES = 16384 };
+
 typedef struct GuestMem GuestMem;
 
 GuestMem *guest_create(void);
 void guest_destroy(GuestMem *mem);
-/* Always zero. Host pages created here are data pages. */
 int guest_host_executable(const GuestMem *mem);
+int guest_page_count(const GuestMem *mem);
+/* Test hook. The next n guest allocations succeed, then one fails.
+   Pass a negative value to disable. */
+void guest_test_fail_allocs_after(int n);
 int guest_map(GuestMem *mem, uint64_t addr, size_t size, int perms,
               const uint8_t *file_bytes, size_t file_len);
 int guest_read(GuestMem *mem, uint64_t addr, void *dst, size_t n);
 int guest_write(GuestMem *mem, uint64_t addr, const void *src, size_t n);
-/* Apply a PE relocation directory. Type 10 adds delta. Any other type fails
-   and leaves the image unchanged. Nothing is called. */
+/* Type 10 adds delta. Unknown types and unmapped or read-only targets fail
+   with no qword changed. Nothing is called. */
 int guest_apply_dir64(GuestMem *mem, const uint8_t *reloc, size_t reloc_len, uint64_t delta);
 int guest_set_logical_execute(GuestMem *mem, uint64_t addr, size_t size, int enabled);
 int guest_logical_execute(const GuestMem *mem, uint64_t addr);

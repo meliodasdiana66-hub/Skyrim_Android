@@ -70,6 +70,48 @@ int main(void) {
                "cross-page read matches");
     }
 
+    {
+        uint8_t before[8], after[8];
+        uint8_t two[24];
+        GuestMem *fresh;
+        expect(guest_read(mem, 0x10000, before, 8) == GUEST_OK, "snapshot relocated qword");
+        memset(two, 0, sizeof two);
+        two[0] = 0x00; two[1] = 0x00; two[2] = 0x01; two[3] = 0x00;
+        two[4] = 12; two[8] = 0x00; two[9] = 0xA0;
+        two[12] = 0x00; two[13] = 0x00; two[14] = 0x02; two[15] = 0x00;
+        two[16] = 12; two[20] = 0x00; two[21] = 0xA0;
+        expect(guest_apply_dir64(mem, two, sizeof two, 1) != GUEST_OK, "later unmapped DIR64 fails");
+        expect(guest_read(mem, 0x10000, after, 8) == GUEST_OK && memcmp(before, after, 8) == 0,
+               "unmapped DIR64 target rolls back earlier writes");
+        expect(guest_map(mem, 0x9000, 8, GUEST_PERM_READ, before, 8) == GUEST_OK, "read-only reloc target");
+        two[12] = 0x00; two[13] = 0x90; two[14] = 0x00; two[15] = 0x00;
+        expect(guest_apply_dir64(mem, two, sizeof two, 1) == GUEST_ERR_PERM, "read-only DIR64 target fails");
+        expect(guest_read(mem, 0x10000, after, 8) == GUEST_OK && memcmp(before, after, 8) == 0,
+               "read-only DIR64 target leaves earlier qwords unchanged");
+        fresh = guest_create();
+        expect(guest_map(fresh, 0x1000, 0x1000, GUEST_PERM_READ | GUEST_PERM_WRITE, file, 16) == GUEST_OK,
+               "baseline page before a failed map");
+        expect(guest_read(fresh, 0x1000, before, 8) == GUEST_OK, "baseline bytes");
+        guest_test_fail_allocs_after(0);
+        expect(guest_map(fresh, 0x4000, 0x3000, GUEST_PERM_READ | GUEST_PERM_WRITE, file, 4) == GUEST_ERR_NOMEM,
+               "allocation failure is reported");
+        guest_test_fail_allocs_after(-1);
+        expect(guest_page_count(fresh) == 1, "failed map adds no pages");
+        expect(guest_read(fresh, 0x1000, after, 8) == GUEST_OK && memcmp(before, after, 8) == 0,
+               "failed map leaves previous bytes unchanged");
+        expect(guest_read(fresh, 0x4000, after, 1) == GUEST_ERR_UNMAPPED, "failed range is not mapped");
+        expect(guest_map(fresh, 0x7000, 0x800, GUEST_PERM_READ, file, 1) == GUEST_OK, "read-only half of a page");
+        expect(guest_map(fresh, 0x7800, 0x800, GUEST_PERM_READ | GUEST_PERM_WRITE, file, 1) == GUEST_OK,
+               "writable half of the same page");
+        expect(guest_write(fresh, 0x7000, "Z", 1) == GUEST_ERR_PERM, "read-only half stays read-only");
+        expect(guest_write(fresh, 0x7800, "Q", 1) == GUEST_OK, "writable half accepts a write");
+        expect(guest_set_logical_execute(fresh, 0x7000, 0x800, 1) == GUEST_OK, "logical execute on one half");
+        expect(guest_logical_execute(fresh, 0x7000) == 1, "requested half is marked");
+        expect(guest_logical_execute(fresh, 0x7800) == 0, "neighbor span is not marked executable");
+        expect(guest_host_executable(fresh) == 0, "mixed page is still not a host executable mapping");
+        guest_destroy(fresh);
+    }
+
     guest_destroy(mem);
     if (g_failures) {
         fprintf(stderr, "%d guest_mem checks failed\n", g_failures);
