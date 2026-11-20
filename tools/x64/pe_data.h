@@ -13,7 +13,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-enum { PE_MAX_IMAGE = 64u * 1024u * 1024u, PE_MAX_IMPORTS = 64, PE_NAME = 64 };
+enum {
+    PE_MAX_IMAGE = 64u * 1024u * 1024u,
+    PE_MAX_DLLS = 256,
+    PE_MAX_SYMBOLS = 16384,
+    PE_NAME = 64
+};
 
 enum {
     PE_OK = 0,
@@ -26,6 +31,8 @@ enum {
 typedef struct PeImport {
     char dll[PE_NAME];
     char name[PE_NAME];
+    uint16_t ordinal;
+    int by_ordinal;
     uint32_t iat_rva;
     int resolved;
 } PeImport;
@@ -40,8 +47,10 @@ typedef struct PeImage {
     int imports_bound;
     int relocations_applied;
     int section_count;
+    int dll_count;
+    int symbol_count;
     int import_count;
-    PeImport imports[PE_MAX_IMPORTS];
+    PeImport *imports;
 } PeImage;
 
 /* host_read_only forces every span to GUEST_PERM_READ. new_base NULL keeps

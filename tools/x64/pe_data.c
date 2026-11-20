@@ -59,6 +59,7 @@ void pe_image_destroy(PeImage *image) {
     if (image == NULL)
         return;
     guest_destroy(image->mem);
+    free(image->imports);
     free(image);
 }
 
@@ -183,7 +184,7 @@ int pe_load_data(const uint8_t *file, size_t file_len, const uint64_t *new_base,
                 pe_image_destroy(image);
                 return PE_ERR_RELOC;
             }
-            if (guest_apply_dir64(image->mem, reloc, reloc_size, (*new_base - preferred) & 0xFFFFFFFFFFFFFFFFULL) != GUEST_OK) {
+            if (guest_loader_reloc(image->mem, reloc, reloc_size, (*new_base - preferred) & 0xFFFFFFFFFFFFFFFFULL) != GUEST_OK) {
                 pe_image_destroy(image);
                 return PE_ERR_RELOC;
             }
@@ -194,76 +195,145 @@ int pe_load_data(const uint8_t *file, size_t file_len, const uint64_t *new_base,
         uint32_t imp_rva = u32(file + opt + 112 + 8);
         uint32_t imp_size = u32(file + opt + 112 + 12);
         uint32_t cursor = imp_rva;
+        PeImport *rows = NULL;
+        int symbols = 0, dlls = 0;
         if (imp_rva != 0 && imp_size >= 20) {
-            if (imp_size > 20 * PE_MAX_IMPORTS) {
+            if (imp_size > 20u * PE_MAX_DLLS) {
                 pe_image_destroy(image);
                 return PE_ERR_RANGE;
             }
-            while (image->import_count < PE_MAX_IMPORTS) {
-                uint32_t desc_off = 0;
-                int s, found = 0;
-                uint32_t oft, name_rva, ft;
+            rows = calloc(PE_MAX_SYMBOLS, sizeof *rows);
+            if (rows == NULL) {
+                pe_image_destroy(image);
+                return PE_ERR_NOMEM;
+            }
+            while (cursor >= imp_rva && cursor - imp_rva + 20 <= imp_size) {
+                uint32_t desc_off = 0, oft, name_rva, ft, step;
+                int s, found = 0, rc;
+                char dll[PE_NAME];
                 for (s = 0; s < (int)nsec; s++) {
-                    if (cursor >= sec_va[s] && cursor + 20 <= sec_va[s] + sec_rawsz[s] &&
-                        cursor + 20 >= cursor) {
+                    if (cursor >= sec_va[s] && cursor + 20 <= sec_va[s] + sec_file[s] && cursor + 20 >= cursor) {
                         desc_off = sec_raw[s] + (cursor - sec_va[s]);
                         found = in_file(file_len, desc_off, 20);
                         break;
                     }
                 }
-                if (!found)
-                    break;
+                if (!found) {
+                    free(rows);
+                    pe_image_destroy(image);
+                    return PE_ERR_FORMAT;
+                }
                 oft = u32(file + desc_off);
                 name_rva = u32(file + desc_off + 12);
                 ft = u32(file + desc_off + 16);
                 if (oft == 0 && name_rva == 0 && ft == 0)
                     break;
-                {
-                    PeImport *row = &image->imports[image->import_count];
-                    uint32_t thunk_rva = oft ? oft : ft;
-                    int rc = copy_name(file, file_len, name_rva, sec_va, sec_raw, sec_file, (int)nsec, row->dll);
-                    if (rc != PE_OK) {
+                if (dlls >= PE_MAX_DLLS) {
+                    free(rows);
+                    pe_image_destroy(image);
+                    return PE_ERR_RANGE;
+                }
+                rc = copy_name(file, file_len, name_rva, sec_va, sec_raw, sec_file, (int)nsec, dll);
+                if (rc != PE_OK) {
+                    free(rows);
+                    pe_image_destroy(image);
+                    return rc;
+                }
+                step = 0;
+                for (;;) {
+                    uint32_t name_rva_thunk = (oft ? oft : ft) + step * 8;
+                    uint32_t iat_rva = (ft ? ft : oft) + step * 8;
+                    uint64_t name_thunk = 0, iat_thunk = 0;
+                    int name_ok = 0, iat_ok = 0;
+                    if (oft == 0 && ft == 0)
+                        break;
+                    if (step >= PE_MAX_SYMBOLS || symbols >= PE_MAX_SYMBOLS) {
+                        free(rows);
                         pe_image_destroy(image);
-                        return rc;
+                        return PE_ERR_RANGE;
                     }
-                    if (thunk_rva != 0) {
-                        uint32_t thunk_off = 0;
-                        int located = 0;
-                        uint64_t thunk;
-                        for (s = 0; s < (int)nsec; s++) {
-                            if (thunk_rva >= sec_va[s] && thunk_rva + 8 <= sec_va[s] + sec_rawsz[s]) {
-                                thunk_off = sec_raw[s] + (thunk_rva - sec_va[s]);
-                                located = in_file(file_len, thunk_off, 8);
+                    if (name_rva_thunk + 8 < name_rva_thunk || iat_rva + 8 < iat_rva) {
+                        free(rows);
+                        pe_image_destroy(image);
+                        return PE_ERR_FORMAT;
+                    }
+                    for (s = 0; s < (int)nsec; s++) {
+                        if (oft && name_rva_thunk >= sec_va[s] && name_rva_thunk + 8 <= sec_va[s] + sec_file[s]) {
+                            uint32_t off = sec_raw[s] + (name_rva_thunk - sec_va[s]);
+                            if (!in_file(file_len, off, 8))
                                 break;
-                            }
+                            name_thunk = u64(file + off);
+                            name_ok = 1;
                         }
-                        if (!located) {
-                            pe_image_destroy(image);
-                            return PE_ERR_FORMAT;
+                        if (ft && iat_rva >= sec_va[s] && iat_rva + 8 <= sec_va[s] + sec_file[s]) {
+                            uint32_t off = sec_raw[s] + (iat_rva - sec_va[s]);
+                            if (!in_file(file_len, off, 8))
+                                break;
+                            iat_thunk = u64(file + off);
+                            iat_ok = 1;
                         }
-                        thunk = u64(file + thunk_off);
-                        if (thunk & 0x8000000000000000ULL) {
-                            row->name[0] = '#';
-                            row->name[1] = 0;
+                    }
+                    if (oft && !name_ok) {
+                        free(rows);
+                        pe_image_destroy(image);
+                        return PE_ERR_FORMAT;
+                    }
+                    if (ft && !iat_ok) {
+                        free(rows);
+                        pe_image_destroy(image);
+                        return PE_ERR_FORMAT;
+                    }
+                    if (!oft)
+                        name_thunk = iat_thunk;
+                    if ((name_thunk == 0) != ((ft ? iat_thunk : name_thunk) == 0)) {
+                        free(rows);
+                        pe_image_destroy(image);
+                        return PE_ERR_FORMAT;
+                    }
+                    if (name_thunk == 0)
+                        break;
+                    {
+                        PeImport *row = &rows[symbols];
+                        memcpy(row->dll, dll, PE_NAME);
+                        row->resolved = 0;
+                        row->iat_rva = ft ? iat_rva : name_rva_thunk;
+                        if (name_thunk & 0x8000000000000000ULL) {
+                            row->by_ordinal = 1;
+                            row->ordinal = (uint16_t)name_thunk;
+                            row->name[0] = 0;
                         } else {
-                            rc = copy_name(file, file_len, (uint32_t)thunk + 2, sec_va, sec_raw, sec_file,
+                            rc = copy_name(file, file_len, (uint32_t)name_thunk + 2, sec_va, sec_raw, sec_file,
                                            (int)nsec, row->name);
                             if (rc != PE_OK) {
+                                free(rows);
                                 pe_image_destroy(image);
                                 return rc;
                             }
+                            row->by_ordinal = 0;
+                            row->ordinal = 0;
                         }
+                        symbols++;
+                        step++;
                     }
-                    row->iat_rva = ft;
-                    row->resolved = 0;
-                    image->import_count++;
                 }
+                dlls++;
                 cursor += 20;
-                if (cursor < imp_rva || cursor - imp_rva >= imp_size)
-                    break;
             }
+            if (symbols == 0) {
+                free(rows);
+                rows = NULL;
+            } else {
+                PeImport *shrunk = realloc(rows, (size_t)symbols * sizeof *rows);
+                if (shrunk != NULL)
+                    rows = shrunk;
+            }
+            image->imports = rows;
+            image->dll_count = dlls;
+            image->symbol_count = symbols;
+            image->import_count = symbols;
         }
     }
+    guest_seal(image->mem);
     if (guest_host_executable(image->mem) != 0) {
         pe_image_destroy(image);
         return PE_ERR_RANGE;

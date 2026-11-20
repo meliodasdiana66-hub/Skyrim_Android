@@ -92,6 +92,9 @@ static int hex_eq(const uint8_t digest[32], const char *hex) {
 int main(int argc, char **argv) {
     const char *path = NULL;
     const char *expect = NULL;
+    const char *base_text = NULL;
+    uint64_t image_base = 0;
+    int have_base = 0;
     FILE *fp;
     long sz;
     uint8_t *file;
@@ -103,13 +106,22 @@ int main(int argc, char **argv) {
             path = argv[++i];
         else if (strcmp(argv[i], "--expect-sha256") == 0 && i + 1 < argc)
             expect = argv[++i];
+        else if (strcmp(argv[i], "--image-base") == 0 && i + 1 < argc)
+            base_text = argv[++i];
         else {
-            fprintf(stderr, "usage: pe_data_map --exe FILE [--expect-sha256 HEX]\n");
+            fprintf(stderr, "usage: pe_data_map --exe FILE [--expect-sha256 HEX] [--image-base 0xBASE]\n");
             return 2;
         }
     }
     if (path == NULL)
         return 2;
+    if (base_text != NULL) {
+        char *end = NULL;
+        image_base = strtoull(base_text, &end, 0);
+        if (end == base_text || *end != 0)
+            return 2;
+        have_base = 1;
+    }
     fp = fopen(path, "rb");
     if (fp == NULL) {
         fprintf(stderr, "not a file\n");
@@ -139,7 +151,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "sha256 mismatch\n");
         return 3;
     }
-    rc = pe_load_data(file, (size_t)sz, NULL, 1, &image);
+    rc = pe_load_data(file, (size_t)sz, have_base ? &image_base : NULL, 1, &image);
     free(file);
     if (rc != PE_OK || image == NULL) {
         fprintf(stderr, "pe data map failed\n");
@@ -160,6 +172,8 @@ int main(int argc, char **argv) {
     printf("  \"sizeOfImage\": %u,\n", image->size_of_image);
     printf("  \"addressOfEntryPoint\": %u,\n", image->entry_rva);
     printf("  \"sectionCount\": %d,\n", image->section_count);
+    printf("  \"dllCount\": %d,\n", image->dll_count);
+    printf("  \"symbolCount\": %d,\n", image->symbol_count);
     printf("  \"importCount\": %d,\n", image->import_count);
     printf("  \"unresolvedImports\": %d,\n", image->import_count);
     printf("  \"relocationsApplied\": %d,\n", image->relocations_applied);

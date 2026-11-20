@@ -44,10 +44,23 @@ class PeDataTests(unittest.TestCase):
             self.assertFalse(report["entryCalled"])
             self.assertFalse(report["importsBound"])
             self.assertFalse(report["hostExecutable"])
-            self.assertEqual(report["importCount"], 1)
-            self.assertEqual(report["unresolvedImports"], 1)
+            self.assertEqual(report["dllCount"], 1)
+            self.assertEqual(report["symbolCount"], 2)
+            self.assertEqual(report["importCount"], 2)
+            self.assertEqual(report["unresolvedImports"], 2)
             self.assertEqual(report["relocationsApplied"], 0)
             self.assertNotIn("CC", json.dumps(report))
+            moved = subprocess.run(
+                [str(cli), "--exe", str(fixture), "--expect-sha256", digest, "--image-base", "0x180000000"],
+                capture_output=True, text=True, check=False)
+            self.assertEqual(moved.returncode, 0, moved.stderr)
+            self.assertEqual(fixture.read_bytes(), before)
+            moved_report = json.loads(moved.stdout)
+            self.assertEqual(moved_report["relocationsApplied"], 1)
+            self.assertFalse(moved_report["entryCalled"])
+            self.assertFalse(moved_report["importsBound"])
+            self.assertFalse(moved_report["hostExecutable"])
+            self.assertEqual(moved_report["imageBase"], 0x180000000)
 
 
 if __name__ == "__main__":

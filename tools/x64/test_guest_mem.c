@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 static int g_failures;
 
@@ -110,6 +111,53 @@ int main(void) {
         expect(guest_logical_execute(fresh, 0x7800) == 0, "neighbor span is not marked executable");
         expect(guest_host_executable(fresh) == 0, "mixed page is still not a host executable mapping");
         guest_destroy(fresh);
+    }
+    {
+        uint8_t rw[8] = {0x11, 0, 0, 0, 0, 0, 0, 0};
+        uint8_t wo[8] = {0x22, 0, 0, 0, 0, 0, 0, 0};
+        uint8_t after[8];
+        uint8_t rel[12];
+        uint8_t mark = 0x5A;
+        int pages;
+        GuestMem *atom = guest_create();
+        memset(rel, 0, sizeof rel);
+        rel[0] = 0x00; rel[1] = 0xA0; rel[2] = 0x00; rel[3] = 0x00;
+        rel[4] = 12;
+        rel[8] = 0x00; rel[9] = 0xA0;
+        rel[10] = 0x08; rel[11] = 0xA0;
+        expect(guest_map(atom, 0xA000, 8, GUEST_PERM_READ | GUEST_PERM_WRITE, rw, 8) == GUEST_OK, "readable reloc slot");
+        expect(guest_map(atom, 0xA008, 8, GUEST_PERM_WRITE, wo, 8) == GUEST_OK, "write-only reloc slot");
+        expect(guest_apply_dir64(atom, rel, sizeof rel, 1) == GUEST_ERR_PERM, "write-only target is not readable");
+        expect(guest_read(atom, 0xA000, after, 8) == GUEST_OK && after[0] == 0x11, "earlier DIR64 qword was not modified");
+        pages = guest_page_count(atom);
+        expect(guest_map(atom, 0xB000, 1, GUEST_PERM_READ | GUEST_PERM_WRITE, &mark, 1) == GUEST_OK, "marker page");
+        expect(guest_map(atom, 0xFFFFFFFFFFFFF800ULL, 0x100, GUEST_PERM_READ | GUEST_PERM_WRITE, &mark, 1) == GUEST_ERR_RANGE,
+               "last page of the address space is refused");
+        expect(guest_page_count(atom) == pages + 1, "wrapped map added no pages");
+        expect(guest_read(atom, 0xB000, after, 1) == GUEST_OK && after[0] == 0x5A, "marker byte unchanged");
+        guest_destroy(atom);
+    }
+    {
+        GuestMem *big = guest_create();
+        const uint32_t span = 59174912u;
+        clock_t t0;
+        uint64_t lookups, visits;
+        int pages;
+        expect(guest_map(big, 0x1000, span, GUEST_PERM_READ, NULL, 0) == GUEST_OK, "image-sized zero-fill maps");
+        pages = guest_page_count(big);
+        expect(pages == 14447, "59 MiB span uses 14447 pages");
+        guest_reset_counters();
+        t0 = clock();
+        expect(guest_set_logical_execute(big, 0x1000, span, 1) == GUEST_OK, "bulk logical execute");
+        lookups = guest_lookup_count();
+        visits = guest_span_visit_count();
+        expect(lookups < (uint64_t)pages, "logical execute does not walk every byte");
+        expect(visits <= (uint64_t)pages * 8, "span visits stay inside the page budget");
+        expect((double)(clock() - t0) / CLOCKS_PER_SEC < 5.0, "logical execute stays inside the time budget");
+        expect(guest_logical_execute(big, 0x1000) == 1 && guest_logical_execute(big, 0x1000 + span - 1) == 1,
+               "both ends of the large span are flagged");
+        expect(guest_host_executable(big) == 0, "large map is not a host executable page");
+        guest_destroy(big);
     }
 
     guest_destroy(mem);

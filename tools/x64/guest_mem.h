@@ -43,6 +43,14 @@ int guest_page_count(const GuestMem *mem);
 /* Test hook. The next n guest allocations succeed, then one fails.
    Pass a negative value to disable. */
 void guest_test_fail_allocs_after(int n);
+void guest_reset_counters(void);
+uint64_t guest_lookup_count(void);
+uint64_t guest_span_visit_count(void);
+/* Loader-only DIR64. Writes page bytes directly and does not change span
+   permissions. Refused after guest_seal. A failure restores every qword
+   this call changed. */
+int guest_loader_reloc(GuestMem *mem, const uint8_t *reloc, size_t reloc_len, uint64_t delta);
+void guest_seal(GuestMem *mem);
 int guest_map(GuestMem *mem, uint64_t addr, size_t size, int perms,
               const uint8_t *file_bytes, size_t file_len);
 int guest_read(GuestMem *mem, uint64_t addr, void *dst, size_t n);
