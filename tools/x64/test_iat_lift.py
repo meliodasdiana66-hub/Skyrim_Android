@@ -467,5 +467,89 @@ class HighIatDiscoveryTests(unittest.TestCase):
         self.assertEqual(verified["verified"][0]["rbx"], 0xA11CE)
 
 
+def _flat_image(pieces):
+    """pieces: (rva, bytes) inside one executable section."""
+    base = min(rva for rva, _blob in pieces)
+    end = max(rva + len(blob) for rva, blob in pieces)
+    raw = bytearray(end - base)
+    for rva, blob in pieces:
+        raw[rva - base:rva - base + len(blob)] = blob
+    info = {"sections": [{
+        "name": ".text",
+        "virtualAddress": base,
+        "virtualSize": len(raw),
+        "sizeOfRawData": len(raw),
+        "pointerToRawData": 0,
+        "executable": True,
+        "writable": False,
+    }]}
+    return bytes(raw), info, base
+
+
+def _rel_jmp(at, target):
+    return b"\xe9" + struct.pack("<i", target - (at + 5))
+
+
+def _rel_call(at, target):
+    return b"\xe8" + struct.pack("<i", target - (at + 5))
+
+
+class ClosureBlockerTests(unittest.TestCase):
+    def test_every_blocker_is_kept(self):
+        root, callee, missing = 0x1000, 0x2000, 0x3000
+        body = _rel_call(root, callee) + _rel_jmp(root + 5, missing)
+        data, info, _base = _flat_image([
+            (root, body),
+            (callee, b"\x0f\x0b"),
+        ])
+        pdata = {root: root + len(body), callee: callee + 2}
+        found = cfg_sandbox._modeled_closure(data, info, pdata, root, {}, 0x4000)
+        self.assertFalse(found["proven"])
+        self.assertFalse(found["cycle"])
+        self.assertEqual(found["blockers"], ["undecodable", "target_not_in_pdata"])
+        self.assertEqual(found["blocker"], "undecodable")
+        self.assertIn("pdataEntryAssumption", found)
+        self.assertIn("shared epilogue", found["pdataEntryAssumption"])
+
+    def test_unbalanced_tail_does_not_walk_as_a_return(self):
+        root, callee = 0x1000, 0x1100
+        body = bytes.fromhex("4883ec08") + _rel_jmp(root + 4, callee)
+        data, info, _base = _flat_image([(root, body), (callee, b"\xc3")])
+        pdata = {root: root + len(body), callee: callee + 1}
+        found = cfg_sandbox._modeled_closure(data, info, pdata, root, {}, 0x2000)
+        self.assertEqual(found["blockers"], ["unbalanced_tail"])
+        self.assertFalse(found["proven"])
+        self.assertEqual(len(found["nodes"]), 1)
+
+    def test_cycle_and_budget_fail_closed(self):
+        a, b = 0x1000, 0x1100
+        data, info, _base = _flat_image([(a, _rel_call(a, b)), (b, _rel_call(b, a))])
+        pdata = {a: a + 5, b: b + 5}
+        found = cfg_sandbox._modeled_closure(data, info, pdata, a, {}, 0x2000)
+        self.assertIn("cycle", found["blockers"])
+        self.assertTrue(found["cycle"])
+        self.assertFalse(found["proven"])
+        back = _rel_jmp(a, a - 0x20)
+        data, info, _base = _flat_image([(a, back)])
+        found = cfg_sandbox._modeled_closure(data, info, {a: a + len(back)}, a, {}, 0x2000)
+        self.assertEqual(found["blockers"], ["back_edge"])
+        self.assertFalse(found["proven"])
+        pieces = []
+        pdata = {}
+        for index in range(9):
+            at = 0x2000 + index * 0x20
+            if index == 8:
+                blob = b"\xc3"
+            else:
+                blob = _rel_jmp(at, at + 0x20)
+            pieces.append((at, blob))
+            pdata[at] = at + len(blob)
+        data, info, _base = _flat_image(pieces)
+        found = cfg_sandbox._modeled_closure(data, info, pdata, 0x2000, {}, 0x3000)
+        self.assertIn("budget", found["blockers"])
+        self.assertFalse(found["proven"])
+        self.assertLessEqual(len(found["nodes"]), 8)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

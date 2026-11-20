@@ -1660,11 +1660,11 @@ def _modeled_closure(data, info, pdata, root, slots, image_size):
 
     def walk(cur, depth):
         if color.get(cur) == 1:
-            return "cycle"
+            return ["cycle"]
         if color.get(cur) == 2:
-            return None
+            return []
         if depth > 8 or len(nodes) >= 8:
-            return "budget"
+            return ["budget"]
         end = pdata.get(cur)
         sec = _section_at(info["sections"], cur)
         node = {
@@ -1680,17 +1680,22 @@ def _modeled_closure(data, info, pdata, root, slots, image_size):
         nodes.append(node)
         if end is None or sec is None or not sec["executable"]:
             node["unresolved"].append("target_not_in_pdata")
-            return "target_not_in_pdata"
+            return ["target_not_in_pdata"]
         insns = _load_body(data, info, cur, end)
         if insns is None:
             node["unresolved"].append("undecodable")
-            return "undecodable"
+            return ["undecodable"]
         color[cur] = 1
         delta = _rsp_delta(insns)
         last = insns[-1]
         node["terminator"] = last["mnemonic"]
         node["rspDelta"] = delta
-        blocker = None
+        local = []
+
+        def add(reason):
+            if reason and reason not in local:
+                local.append(reason)
+
         for insn in insns:
             name = insn["mnemonic"]
             if name in JCC or name == "jmp":
@@ -1701,46 +1706,57 @@ def _modeled_closure(data, info, pdata, root, slots, image_size):
                     "pdata": _pdata_owner(pdata, target),
                 })
                 if target <= insn["address"]:
-                    blocker = "back_edge"
+                    add("back_edge")
                 elif not intra and not (name == "jmp" and insn is last):
-                    blocker = "unproven_branch"
+                    add("unproven_branch")
                 elif name == "jmp" and insn is last:
                     if delta != 0:
-                        blocker = "unbalanced_tail"
+                        add("unbalanced_tail")
                     else:
-                        found = walk(target, depth + 1)
-                        if found:
-                            blocker = found
+                        for item in walk(target, depth + 1):
+                            add(item)
             elif insn.get("mem") or insn.get("rip"):
-                blocker = "memory_access"
+                add("memory_access")
             elif name == "call":
                 node["targets"].append({
                     "mnemonic": "call", "at": insn["address"], "target": insn["target"],
                     "intra": False, "pdata": _pdata_owner(pdata, insn["target"]),
                 })
-                found = walk(insn["target"], depth + 1)
-                if found:
-                    blocker = found
+                for item in walk(insn["target"], depth + 1):
+                    add(item)
             elif name == "call_rip":
                 slot = slots.get(insn["iat"])
                 if slot is None or slot["ordinal"] or not slot["modeled"]:
-                    blocker = "unresolved_import"
+                    add("unresolved_import")
             elif name not in _STRAIGHT and name not in ("push", "pop", "ret"):
-                blocker = "unsupported_instruction"
+                add("unsupported_instruction")
         if last["mnemonic"] not in ("ret", "jmp"):
-            blocker = "missing_ret"
-        if blocker:
-            node["unresolved"].append(blocker)
+            add("missing_ret")
+        node["unresolved"] = local
         color[cur] = 2
-        return blocker
+        return local
 
-    blocker = walk(root, 0)
+    found = walk(root, 0)
+    blockers = []
+    for node in nodes:
+        for reason in node["unresolved"]:
+            if reason not in blockers:
+                blockers.append(reason)
+    for reason in found:
+        if reason not in blockers:
+            blockers.append(reason)
     return {
-        "proven": blocker is None,
-        "cycle": blocker == "cycle",
-        "blocker": blocker,
+        "proven": not blockers,
+        "cycle": "cycle" in blockers,
+        "blocker": blockers[0] if blockers else None,
+        "blockers": blockers,
         "nodes": nodes,
         "executed": False,
+        "pdataEntryAssumption": (
+            "Follows a target only when that address is a pdata function entry. "
+            "A shared epilogue that is not a pdata start stays unresolved. "
+            "That is a limit of this checker, not a proof the transfer is illegal x64."
+        ),
     }
 
 
@@ -1934,8 +1950,10 @@ def discover_modeled_iat(data):
         "modeledCandidates lists every routine that calls one of those two, with "
         "import names, direct-call RVAs, jump targets, and access metadata. "
         "A jmp is control flow, not a data load. A tail transfer is proven only "
-        "when RSP is unchanged and the callee returns. Width is not an object "
-        "size. No instruction bytes are included."
+        "when RSP is unchanged and the target is a pdata entry that returns. "
+        "closure.blockers keeps every failure. A shared epilogue that is not a "
+        "pdata start stays unresolved and is not declared illegal x64. "
+        "Width is not an object size. No instruction bytes are included."
     )
     return report
 
