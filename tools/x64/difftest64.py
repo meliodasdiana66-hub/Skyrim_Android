@@ -135,7 +135,9 @@ def exec_unicorn(code, base, cpu, mem):
     for reg, value in zip(UC_REGS, cpu["r"]):
         uc.reg_write(reg, int(value) & 0xFFFFFFFFFFFFFFFF)
     uc.reg_write(UC_X86_REG_EFLAGS, _flags_to_eflags(cpu))
-    uc.emu_start(base, base + len(code))
+    # Stop at a final ret without executing it. Executing ret would pop a
+    # return address and is outside the allowlist.
+    uc.emu_start(base, base + lift64.executed_length(code, base))
     out = {"r": [uc.reg_read(reg) for reg in UC_REGS]}
     out.update(_eflags_to_flags(uc.reg_read(UC_X86_REG_EFLAGS)))
     return out, bytearray(uc.mem_read(0, MEMSZ))

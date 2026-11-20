@@ -183,8 +183,7 @@ def _emit(insn):
     raise Unsupported("unsupported instruction '%s' at %#x" % (mn, insn.address))
 
 
-def lift_snippet(code, base):
-    """Return the C function snippet() for these bytes, or raise Unsupported."""
+def _validated_insns(code, base):
     if not isinstance(code, (bytes, bytearray)) or isinstance(code, str):
         raise Unsupported("code must be bytes")
     code = bytes(code)
@@ -194,9 +193,33 @@ def lift_snippet(code, base):
         raise Unsupported("snippet length %d is outside 1..%d" % (len(code), MAX_CODE))
     if not isinstance(base, int) or base < 0 or base > 0xFFFFFFFFFFFFFFFF:
         raise Unsupported("bad base")
-    lines = ["void snippet(Cpu64 *c, uint8_t *mem) {", "    (void)c;", "    (void)mem;"]
-    for insn in _decode(code, base):
+    insns = _decode(code, base)
+    for insn in insns:
         _prefixes(insn)
+    if insns[-1].mnemonic == "ret":
+        if insns[-1].size != 1 or insns[-1].op_str.strip():
+            raise Unsupported("ret form rejected at %#x; only a final one-byte ret is accepted" % insns[-1].address)
+        if any(insn.mnemonic == "ret" for insn in insns[:-1]):
+            raise Unsupported("ret only allowed as the final instruction")
+        # The final ret is a leaf terminator. It is not emitted or executed:
+        # a real ret would read the stack, which is not part of this allowlist.
+        return code, insns[:-1], insns[-1].address - base
+    if any(insn.mnemonic == "ret" for insn in insns):
+        raise Unsupported("ret only allowed as the final instruction")
+    return code, insns, len(code)
+
+
+def executed_length(code, base):
+    """Bytes emulated before a final one-byte ret. The ret itself is not executed."""
+    _code, _insns, length = _validated_insns(code, base)
+    return length
+
+
+def lift_snippet(code, base):
+    """Return the C function snippet() for these bytes, or raise Unsupported."""
+    _code, insns, _length = _validated_insns(code, base)
+    lines = ["void snippet(Cpu64 *c, uint8_t *mem) {", "    (void)c;", "    (void)mem;"]
+    for insn in insns:
         for line in _emit(insn):
             lines.append("    " + line)
     lines.append("}")

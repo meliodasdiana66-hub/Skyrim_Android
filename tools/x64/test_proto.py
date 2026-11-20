@@ -309,6 +309,25 @@ class LiftTests(unittest.TestCase):
         state = cpu(rax=5, cf=1, zf=1)
         check(code, BASE, state)
 
+    def test_final_ret_is_not_executed(self):
+        # mov eax, 1; ret. RSP is 0 and the first bytes are a canary. Executing
+        # ret would pop that canary and change RSP.
+        code = bytes.fromhex("b801000000c3")
+        image = mem_with(code, BASE)
+        image[0:8] = b"CANARY!!"
+        state = cpu(rsp=0, rax=0xFFFFFFFFFFFFFFFF)
+        check(code, BASE, state)
+        got_cpu, got_mem = difftest64.run_both(code, BASE, state, image)
+        self.assertEqual(got_cpu["r"][0], 1)
+        self.assertEqual(got_cpu["r"][4], 0)
+        self.assertEqual(bytes(got_mem[0:8]), b"CANARY!!")
+
+    def test_ret_in_the_middle_and_ret_imm_are_rejected(self):
+        with self.assertRaises(lift64.Unsupported):
+            lift64.lift_snippet(bytes.fromhex("b801000000c390"), BASE)
+        with self.assertRaises(lift64.Unsupported):
+            lift64.lift_snippet(bytes.fromhex("c20000"), BASE)
+
     def test_lock_is_rejected(self):
         code = bytes.fromhex("f0480118")  # lock add qword ptr [rax], rbx
         with self.assertRaises(lift64.Unsupported) as caught:

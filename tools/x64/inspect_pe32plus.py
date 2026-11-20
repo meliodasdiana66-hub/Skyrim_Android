@@ -76,6 +76,11 @@ def _sections(data, off, count):
     return out
 
 
+def file_offset_for_rva(sections, rva, size):
+    """Translate an RVA to a file offset. Raises PeFormatError if the bytes are not in the file."""
+    return _rva_to_off(sections, rva, size)
+
+
 def _rva_to_off(sections, rva, size):
     for sec in sections:
         span = max(sec["virtualSize"], sec["sizeOfRawData"])

@@ -3,5 +3,6 @@
 set -eu
 cd "$(dirname "$0")"
 python3 -B test_proto.py
+python3 -B test_leafcheck.py
 python3 -m py_compile ../lift.py ../discover.py ../difftest.py ../peimg.py
 echo "x64 prototype tests passed; LE py_compile passed"

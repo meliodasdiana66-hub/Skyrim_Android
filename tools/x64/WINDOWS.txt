@@ -1,0 +1,18 @@
+Read-only leaf scan for the local SkyrimSE.exe. Do not copy the EXE, BSA, ESM, or DLLs anywhere.
+Do not install Python packages for the dry-run. The dry-run uses only the Python standard library.
+It does not start the game and does not write instruction bytes into the report.
+
+From this directory, or from the unpacked tools\x64 folder:
+
+  py -3 leafcheck.py --exe "D:\Skyrim Anniversary Edition\SkyrimSE.exe" --expect-sha256 21A6F8244A57E880D02E600ADF61178AB5483DB7B3CCA8DBFC97D7CA1F081E18 --dry-run --report "%USERPROFILE%\skyrimse-leaf-dryrun.json"
+
+If py is not the launcher:
+
+  python leafcheck.py --exe "D:\Skyrim Anniversary Edition\SkyrimSE.exe" --expect-sha256 21A6F8244A57E880D02E600ADF61178AB5483DB7B3CCA8DBFC97D7CA1F081E18 --dry-run --report "%USERPROFILE%\skyrimse-leaf-dryrun.json"
+
+Exit code 3 means the SHA-256 does not match; nothing was scanned.
+candidates[].status is always candidate_not_executed after a dry-run.
+verifiedFunctions stays empty. rejectionCounts explains why ranges were dropped.
+Entry point and .bind are never selected. A candidate is not a verified function.
+
+--execute is a later step and is not part of this command. It needs capstone, unicorn, and clang, which must not be installed unless that is agreed separately. Even then it only differential-tests candidates; it does not run the game.
