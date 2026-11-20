@@ -39,7 +39,7 @@ Data map of the EXE. The file is opened read-only and is not modified. Pages are
 
   pe_data_map --exe "D:\Skyrim Anniversary Edition\SkyrimSE.exe" --expect-sha256 21A6F8244A57E880D02E600ADF61178AB5483DB7B3CCA8DBFC97D7CA1F081E18
 
-Alternate base. Relocation is staged before the pages become read-only, so read-only DIR64 targets are updated without granting a guest write. The file is still not modified, the entry point is not called, and hostExecutable stays false. importCount is the symbol count; dllCount is the descriptor count.
+Alternate base. Relocation is staged before the pages become read-only, so read-only DIR64 targets are updated without granting a guest write. The file is still not modified, the entry point is not called, and hostExecutable stays false. dllCount is the descriptor count. symbolCount and importCount are every thunk, including MSVC decorated names up to 256 characters. A longer name fails the whole map with "import name exceeds cap" and leaves no image. Nothing is bound.
 
   pe_data_map --exe "D:\Skyrim Anniversary Edition\SkyrimSE.exe" --expect-sha256 21A6F8244A57E880D02E600ADF61178AB5483DB7B3CCA8DBFC97D7CA1F081E18 --image-base 0x150000000
 

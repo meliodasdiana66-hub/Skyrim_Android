@@ -17,7 +17,10 @@ enum {
     PE_MAX_IMAGE = 64u * 1024u * 1024u,
     PE_MAX_DLLS = 256,
     PE_MAX_SYMBOLS = 16384,
-    PE_NAME = 64
+    /* Usable characters, not counting the trailing NUL. DLL names stay short.
+       Symbol names must hold MSVC decorated forms (observed up to 109). */
+    PE_DLL_NAME = 64,
+    PE_SYMBOL_NAME = 256
 };
 
 enum {
@@ -25,12 +28,13 @@ enum {
     PE_ERR_FORMAT = 1,
     PE_ERR_RANGE = 2,
     PE_ERR_NOMEM = 3,
-    PE_ERR_RELOC = 4
+    PE_ERR_RELOC = 4,
+    PE_ERR_NAME = 5
 };
 
 typedef struct PeImport {
-    char dll[PE_NAME];
-    char name[PE_NAME];
+    char dll[PE_DLL_NAME + 1];
+    char name[PE_SYMBOL_NAME + 1];
     uint16_t ordinal;
     int by_ordinal;
     uint32_t iat_rva;

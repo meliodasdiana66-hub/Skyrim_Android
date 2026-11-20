@@ -149,7 +149,7 @@ int main(int argc, char **argv) {
     {
         uint8_t bad[0x800];
         memcpy(bad, file, sizeof bad);
-        memset(bad + 0x680, 'A', 70);
+        memset(bad + 0x6C2, 'A', 0x700 - 0x6C2);
         image = (PeImage *)1;
         expect(pe_load_data(bad, sizeof bad, NULL, 1, &image) == PE_ERR_FORMAT && image == NULL,
                "unterminated import name allocates nothing");
@@ -166,6 +166,77 @@ int main(int argc, char **argv) {
     image = (PeImage *)1;
     expect(pe_load_data(file, sizeof file, NULL, 1, &image) == PE_ERR_RANGE && image == NULL,
            "raw section past the file allocates nothing");
+    {
+        uint8_t big[0x1000];
+        char long_name[110];
+        char huge[260];
+        int n;
+        memset(long_name, 'X', 108);
+        memcpy(long_name, "?decorated@std@@YAX", 18);
+        long_name[108] = 'Z';
+        long_name[109] = 0;
+        expect(strlen(long_name) == 109, "fixture name is 109 characters");
+        memset(big, 0, sizeof big);
+        big[0] = 'M'; big[1] = 'Z';
+        u32(big + 0x3C, 0x80);
+        memcpy(big + 0x80, "PE\0\0", 4);
+        u16(big + 0x84, 0x8664);
+        u16(big + 0x86, 1);
+        u16(big + 0x94, 0xF0);
+        u16(big + 0x98, 0x20B);
+        u32(big + 0x98 + 16, 0x1000);
+        u64(big + 0x98 + 24, 0x140000000ULL);
+        u32(big + 0x98 + 56, 0x3000);
+        u32(big + 0x98 + 108, 16);
+        u32(big + 0x98 + 112 + 8, 0x2000);
+        u32(big + 0x98 + 112 + 12, 40);
+        memcpy(big + 0x188, ".data", 5);
+        u32(big + 0x188 + 8, 0x800);
+        u32(big + 0x188 + 12, 0x2000);
+        u32(big + 0x188 + 16, 0x600);
+        u32(big + 0x188 + 20, 0x400);
+        u32(big + 0x188 + 36, 0x40000040);
+        u32(big + 0x400, 0x2040);
+        u32(big + 0x40C, 0x2100);
+        u64(big + 0x440, 0x2200);
+        memcpy(big + 0x500, "MSVCP140.dll", 13);
+        memcpy(big + 0x602, long_name, 110);
+        image = NULL;
+        expect(pe_load_data(big, sizeof big, NULL, 1, &image) == PE_OK, "109-character decorated name loads");
+        if (image != NULL) {
+            expect(image->symbol_count == 1, "one long symbol");
+            expect(strcmp(image->imports[0].name, long_name) == 0, "name is stored without truncation");
+            expect(image->imports[0].resolved == 0 && image->entry_called == 0, "long name is still unresolved");
+            pe_image_destroy(image);
+        }
+        if (argc > 2) {
+            FILE *fp = fopen(argv[2], "wb");
+            if (fp == NULL)
+                return 1;
+            if (fwrite(big, 1, sizeof big, fp) != sizeof big) {
+                fclose(fp);
+                return 1;
+            }
+            fclose(fp);
+        }
+        memset(huge, 'Y', 257);
+        huge[257] = 0;
+        memcpy(big + 0x602, huge, 258);
+        if (argc > 3) {
+            FILE *fp = fopen(argv[3], "wb");
+            if (fp == NULL)
+                return 1;
+            if (fwrite(big, 1, sizeof big, fp) != sizeof big) {
+                fclose(fp);
+                return 1;
+            }
+            fclose(fp);
+        }
+        image = (PeImage *)1;
+        expect(pe_load_data(big, sizeof big, NULL, 1, &image) == PE_ERR_NAME && image == NULL,
+               "oversized decorated name fails with no image");
+        (void)n;
+    }
     if (g_failures) {
         fprintf(stderr, "%d pe_data checks failed\n", g_failures);
         return 1;

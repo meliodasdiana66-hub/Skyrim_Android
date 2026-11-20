@@ -30,7 +30,10 @@ class PeDataTests(unittest.TestCase):
                 capture_output=True, text=True, check=False)
             self.assertEqual(cli_built.returncode, 0, cli_built.stderr)
             fixture = td / "fixture.bin"
-            ran = subprocess.run([str(unit), str(fixture)], capture_output=True, text=True, check=False)
+            long_fix = td / "long.bin"
+            huge_fix = td / "huge.bin"
+            ran = subprocess.run([str(unit), str(fixture), str(long_fix), str(huge_fix)],
+                                 capture_output=True, text=True, check=False)
             self.assertEqual(ran.returncode, 0, ran.stderr)
             before = fixture.read_bytes()
             digest = hashlib.sha256(before).hexdigest()
@@ -61,6 +64,23 @@ class PeDataTests(unittest.TestCase):
             self.assertFalse(moved_report["importsBound"])
             self.assertFalse(moved_report["hostExecutable"])
             self.assertEqual(moved_report["imageBase"], 0x180000000)
+            long_bytes = long_fix.read_bytes()
+            long_sha = hashlib.sha256(long_bytes).hexdigest()
+            official = subprocess.run(
+                [str(cli), "--exe", str(long_fix), "--expect-sha256", long_sha],
+                capture_output=True, text=True, check=False)
+            self.assertEqual(official.returncode, 0, official.stderr)
+            self.assertEqual(long_fix.read_bytes(), long_bytes)
+            official_report = json.loads(official.stdout)
+            self.assertTrue(official_report["mapped"])
+            self.assertEqual(official_report["symbolCount"], 1)
+            self.assertFalse(official_report["entryCalled"])
+            self.assertFalse(official_report["hostExecutable"])
+            refused = subprocess.run(
+                [str(cli), "--exe", str(huge_fix)],
+                capture_output=True, text=True, check=False)
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("import name exceeds cap", refused.stderr)
 
 
 if __name__ == "__main__":

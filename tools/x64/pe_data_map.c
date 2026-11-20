@@ -153,6 +153,10 @@ int main(int argc, char **argv) {
     }
     rc = pe_load_data(file, (size_t)sz, have_base ? &image_base : NULL, 1, &image);
     free(file);
+    if (rc == PE_ERR_NAME) {
+        fprintf(stderr, "import name exceeds cap\n");
+        return 2;
+    }
     if (rc != PE_OK || image == NULL) {
         fprintf(stderr, "pe data map failed\n");
         return 2;

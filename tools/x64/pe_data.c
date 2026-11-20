@@ -31,25 +31,36 @@ static int in_file(size_t file_len, uint32_t off, uint32_t size) {
 
 static int copy_name(const uint8_t *file, size_t file_len, uint32_t rva,
                      const uint32_t *sec_va, const uint32_t *sec_raw, const uint32_t *sec_n,
-                     int nsec, char *dst) {
-    int s, i;
+                     int nsec, char *dst, size_t cap) {
+    int s;
+    size_t i;
     for (s = 0; s < nsec; s++) {
         if (rva < sec_va[s] || rva >= sec_va[s] + sec_n[s])
             continue;
         {
             uint32_t off = sec_raw[s] + (rva - sec_va[s]);
-            if (!in_file(file_len, off, 1))
-                return PE_ERR_FORMAT;
-            for (i = 0; i < PE_NAME - 1; i++) {
-                if (!in_file(file_len, off + (uint32_t)i, 1))
+            for (i = 0; i < cap; i++) {
+                unsigned char ch;
+                if (!in_file(file_len, off + (uint32_t)i, 1) ||
+                    rva + (uint32_t)i >= sec_va[s] + sec_n[s])
                     return PE_ERR_FORMAT;
-                dst[i] = (char)file[off + (uint32_t)i];
-                if (dst[i] == 0)
-                    return dst[0] ? PE_OK : PE_ERR_FORMAT;
-                if ((unsigned char)dst[i] < 0x20 || (unsigned char)dst[i] > 0x7e)
+                ch = file[off + (uint32_t)i];
+                if (ch == 0) {
+                    dst[i] = 0;
+                    return i > 0 ? PE_OK : PE_ERR_FORMAT;
+                }
+                if (ch < 0x20 || ch > 0x7e)
                     return PE_ERR_FORMAT;
+                dst[i] = (char)ch;
             }
-            return PE_ERR_FORMAT;
+            if (!in_file(file_len, off + (uint32_t)cap, 1) ||
+                rva + (uint32_t)cap >= sec_va[s] + sec_n[s])
+                return PE_ERR_FORMAT;
+            if (file[off + (uint32_t)cap] == 0) {
+                dst[cap] = 0;
+                return PE_OK;
+            }
+            return PE_ERR_NAME;
         }
     }
     return PE_ERR_FORMAT;
@@ -210,7 +221,7 @@ int pe_load_data(const uint8_t *file, size_t file_len, const uint64_t *new_base,
             while (cursor >= imp_rva && cursor - imp_rva + 20 <= imp_size) {
                 uint32_t desc_off = 0, oft, name_rva, ft, step;
                 int s, found = 0, rc;
-                char dll[PE_NAME];
+                char dll[PE_DLL_NAME + 1];
                 for (s = 0; s < (int)nsec; s++) {
                     if (cursor >= sec_va[s] && cursor + 20 <= sec_va[s] + sec_file[s] && cursor + 20 >= cursor) {
                         desc_off = sec_raw[s] + (cursor - sec_va[s]);
@@ -233,7 +244,7 @@ int pe_load_data(const uint8_t *file, size_t file_len, const uint64_t *new_base,
                     pe_image_destroy(image);
                     return PE_ERR_RANGE;
                 }
-                rc = copy_name(file, file_len, name_rva, sec_va, sec_raw, sec_file, (int)nsec, dll);
+                rc = copy_name(file, file_len, name_rva, sec_va, sec_raw, sec_file, (int)nsec, dll, PE_DLL_NAME);
                 if (rc != PE_OK) {
                     free(rows);
                     pe_image_destroy(image);
@@ -294,7 +305,7 @@ int pe_load_data(const uint8_t *file, size_t file_len, const uint64_t *new_base,
                         break;
                     {
                         PeImport *row = &rows[symbols];
-                        memcpy(row->dll, dll, PE_NAME);
+                        memcpy(row->dll, dll, PE_DLL_NAME + 1);
                         row->resolved = 0;
                         row->iat_rva = ft ? iat_rva : name_rva_thunk;
                         if (name_thunk & 0x8000000000000000ULL) {
@@ -303,7 +314,7 @@ int pe_load_data(const uint8_t *file, size_t file_len, const uint64_t *new_base,
                             row->name[0] = 0;
                         } else {
                             rc = copy_name(file, file_len, (uint32_t)name_thunk + 2, sec_va, sec_raw, sec_file,
-                                           (int)nsec, row->name);
+                                           (int)nsec, row->name, PE_SYMBOL_NAME);
                             if (rc != PE_OK) {
                                 free(rows);
                                 pe_image_destroy(image);
