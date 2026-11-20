@@ -62,14 +62,29 @@ def _analyze_stack(insns):
         return any(index == 4 for index, _bits in insn["writes"])
 
     has_sub_rsp = any(insn["mnemonic"] == "sub" and _writes_rsp(insn) for insn in insns)
-    stackish = has_sub_rsp or any(
-        insn.get("stack") or (insn.get("mem") or [None])[0] == "rsp" for insn in insns)
+    stackish = has_sub_rsp or any(insn.get("stack") or insn.get("mem") for insn in insns)
     if not stackish:
         # Lone `add rsp, imm` only changes the register. It stays on the
         # varying-RSP cases so previously matched leaves are not dropped.
         return None
     delta = 0
     deepest = 0
+    ptrs = {}
+
+    def _kill(written):
+        for index, _bits in written:
+            if index != 4:
+                ptrs.pop(index, None)
+
+    def _in_frame(lo, nbytes):
+        hi = lo + nbytes
+        frame_lo = STACK_TOP + delta
+        if not (frame_lo <= lo and hi <= STACK_TOP):
+            return "stack_external"
+        if nbytes == 16 and (lo & 15):
+            return "xmm_align"
+        return None
+
     for insn in insns:
         if insn["mnemonic"] == "ret":
             continue
@@ -87,6 +102,17 @@ def _analyze_stack(insns):
             return "rsp_untracked"
         if insn["mnemonic"] == "mov" and any(index == 4 for index, _bits in insn["reads"]) and not insn.get("mem"):
             return "rsp_untracked"
+        if insn["mnemonic"] == "lea":
+            dest = insn["writes"][0][0]
+            disp = insn.get("leaDisp")
+            srcs = [index for index, _bits in insn["reads"]]
+            if disp is not None and srcs == [4]:
+                ptrs[dest] = delta + disp
+            elif disp is not None and len(srcs) == 1 and srcs[0] in ptrs:
+                ptrs[dest] = ptrs[srcs[0]] + disp
+            else:
+                ptrs.pop(dest, None)
+            continue
         stack = insn.get("stack")
         if stack:
             if stack[0] == "push":
@@ -99,16 +125,26 @@ def _analyze_stack(insns):
                 if delta >= 0:
                     return "stack_underflow"
                 delta += stack[1]
+                _kill(insn["writes"])
                 continue
         mem = insn.get("mem")
         if mem and mem[0] == "rsp":
             _base, disp, nbytes, _kind = mem
-            lo = STACK_TOP + delta + disp
-            hi = lo + nbytes
-            frame_lo = STACK_TOP + delta
-            if not (frame_lo <= lo and hi <= STACK_TOP):
-                return "stack_external"
+            reason = _in_frame(STACK_TOP + delta + disp, nbytes)
+            if reason:
+                return reason
+            _kill(insn["writes"])
             continue
+        if mem and mem[0] == "base":
+            _tag, base, disp, nbytes, _kind = mem
+            if base not in ptrs:
+                return "sandbox_untracked"
+            reason = _in_frame(STACK_TOP + ptrs[base] + disp, nbytes)
+            if reason:
+                return reason
+            _kill(insn["writes"])
+            continue
+        _kill(insn.get("writes") or [])
     final = STACK_TOP + delta
     return {
         "pinnedRsp": STACK_TOP,
@@ -322,10 +358,13 @@ def _case_cpu(spec):
         names = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
                  "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
         regs[names.index(name)] = value
+    seed = spec.get("xmm_seed", 0)
+    xmm = [((seed + 1) * 0x0102040810204081 * (i + 1)) & ((1 << 128) - 1) for i in range(16)]
     return {
         "r": regs,
         "cf": spec.get("cf", 0), "pf": 0, "af": 0,
         "zf": spec.get("zf", 0), "sf": 0, "of": 0,
+        "xmm": xmm,
     }
 
 

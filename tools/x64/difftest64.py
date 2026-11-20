@@ -24,7 +24,7 @@ import lift64
 
 HERE = Path(__file__).resolve().parent
 MEMSZ = 0x10000
-CPU_BYTES = 152
+CPU_BYTES = 408
 NAMES = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
          "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
 UC_REGS = [UC_X86_REG_RAX, UC_X86_REG_RCX, UC_X86_REG_RDX, UC_X86_REG_RBX,
@@ -35,16 +35,33 @@ FLAGS = ("cf", "pf", "af", "zf", "sf", "of")
 _BINS = {}
 
 
+def _xmm_qwords(cpu):
+    raw = list(cpu.get("xmm") or [0] * 16)
+    if len(raw) != 16:
+        raise ValueError("xmm state must have 16 registers")
+    out = []
+    for value in raw:
+        value &= (1 << 128) - 1
+        out.append(value & 0xFFFFFFFFFFFFFFFF)
+        out.append(value >> 64)
+    return out
+
+
 def pack_cpu(cpu):
-    return struct.pack("<16Q6I", *[int(x) & 0xFFFFFFFFFFFFFFFF for x in cpu["r"]],
-                       *(int(cpu[name]) & 0xFFFFFFFF for name in FLAGS))
+    return struct.pack("<16Q6I32Q", *[int(x) & 0xFFFFFFFFFFFFFFFF for x in cpu["r"]],
+                       *(int(cpu[name]) & 0xFFFFFFFF for name in FLAGS), *_xmm_qwords(cpu))
 
 
 def unpack_cpu(buf):
-    vals = struct.unpack("<16Q6I", buf[:CPU_BYTES])
+    vals = struct.unpack("<16Q6I32Q", buf[:CPU_BYTES])
     out = {"r": list(vals[:16])}
     for name, value in zip(FLAGS, vals[16:]):
         out[name] = value
+    xmm = []
+    flat = vals[22:]
+    for i in range(16):
+        xmm.append(flat[2 * i] | (flat[2 * i + 1] << 64))
+    out["xmm"] = xmm
     return out
 
 
@@ -134,12 +151,17 @@ def exec_unicorn(code, base, cpu, mem):
     uc.mem_write(0, bytes(mem))
     for reg, value in zip(UC_REGS, cpu["r"]):
         uc.reg_write(reg, int(value) & 0xFFFFFFFFFFFFFFFF)
+    from unicorn import x86_const as _ux
+    for index, value in enumerate(cpu.get("xmm") or [0] * 16):
+        uc.reg_write(_ux.UC_X86_REG_XMM0 + index, int(value) & ((1 << 128) - 1))
     uc.reg_write(UC_X86_REG_EFLAGS, _flags_to_eflags(cpu))
     # Stop at a final ret without executing it. Executing ret would pop a
     # return address and is outside the allowlist.
     uc.emu_start(base, base + lift64.executed_length(code, base))
     out = {"r": [uc.reg_read(reg) for reg in UC_REGS]}
     out.update(_eflags_to_flags(uc.reg_read(UC_X86_REG_EFLAGS)))
+    from unicorn import x86_const as _ux
+    out["xmm"] = [uc.reg_read(_ux.UC_X86_REG_XMM0 + index) & ((1 << 128) - 1) for index in range(16)]
     return out, bytearray(uc.mem_read(0, MEMSZ))
 
 
@@ -155,6 +177,9 @@ def compare(code, base, cpu, mem, compare_af=True):
             continue
         if host_cpu[name] != uni_cpu[name]:
             diffs.append("%s host=%s unicorn=%s" % (name, host_cpu[name], uni_cpu[name]))
+    for index, (host_x, uni_x) in enumerate(zip(host_cpu.get("xmm") or [], uni_cpu.get("xmm") or [])):
+        if host_x != uni_x:
+            diffs.append("xmm%d host=%#x unicorn=%#x" % (index, host_x, uni_x))
     if bytes(host_mem) != bytes(uni_mem):
         for addr, (hb, ub) in enumerate(zip(host_mem, uni_mem)):
             if hb != ub:

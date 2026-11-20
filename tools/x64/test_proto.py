@@ -377,6 +377,40 @@ class LiftTests(unittest.TestCase):
         self.assertEqual(got["r"][0], 0xFFFFFFFFFFFFFFFF)
         self.assertEqual(got["cf"], 1)
 
+    def test_stack_immediate_store_sign_and_partial(self):
+        # qword store sign-extends imm32. Neighbouring bytes are not this test's subject.
+        code = bytes.fromhex("48c7042400000080")  # mov qword [rsp], 0x80000000
+        state = cpu(rsp=0xE000)
+        image = mem_with(code, BASE)
+        image[0xE000:0xE008] = b"\x11" * 8
+        check(code, BASE, state, None)
+        # check() rebuilds memory, so set the pattern on the image passed to run_both
+        image = mem_with(code, BASE)
+        image[0xE000:0xE008] = b"\x11" * 8
+        got_cpu, got_mem = difftest64.run_both(code, BASE, state, image)
+        self.assertEqual(got_mem[0xE000:0xE008], bytes.fromhex("00000080ffffffff"))
+        partial = bytes.fromhex("c7042478563412")  # mov dword [rsp], 0x12345678
+        image = mem_with(partial, BASE)
+        image[0xE000:0xE008] = b"\xff" * 8
+        _cpu, got_mem = difftest64.run_both(partial, BASE, state, image)
+        self.assertEqual(got_mem[0xE000:0xE008], bytes.fromhex("78563412ffffffff"))
+
+    def test_movaps_alignment(self):
+        state = cpu(rsp=0xE000)
+        state["xmm"] = [0x112233445566778899aabbccddeeff00] + [0] * 15
+        aligned = bytes.fromhex("0f290424")  # movaps [rsp], xmm0
+        image = mem_with(aligned, BASE)
+        got_cpu, got_mem = difftest64.run_both(aligned, BASE, state, image)
+        self.assertEqual(got_mem[0xE000:0xE010], (0x112233445566778899aabbccddeeff00).to_bytes(16, "little"))
+        self.assertEqual(got_cpu["xmm"][0], state["xmm"][0])
+        bad = bytes.fromhex("0f29442408")  # movaps [rsp+8], xmm0
+        image = mem_with(bad, BASE)
+        with self.assertRaises(RuntimeError):
+            difftest64.exec_host(bad, BASE, state, image)
+        # This Unicorn build executes unaligned MOVAPS. The host aborts, and the
+        # leaf scanner rejects the address before a comparison is attempted.
+        difftest64.exec_unicorn(bad, BASE, state, image)
+
     def test_lea_forms_do_not_read_memory(self):
         # lea rax, [rcx+8]; flags stay set; memory unchanged.
         code = bytes.fromhex("488d4108")

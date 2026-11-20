@@ -94,7 +94,7 @@ def _one(code, start, addr):
         return 32
 
     def finish(mnemonic, cursor, reads, writes, rip=None, mem=None, stack=None, imm=None,
-               lea_target=None, lea_disp=None):
+               lea_target=None, lea_disp=None, xmm=None):
         size = cursor - start
         insn = {
             "mnemonic": mnemonic,
@@ -114,6 +114,8 @@ def _one(code, start, addr):
             insn["leaTarget"] = lea_target
         if lea_disp is not None:
             insn["leaDisp"] = lea_disp
+        if xmm is not None:
+            insn["xmm"] = xmm
         return insn, size
 
     if op == 0xC3:
@@ -156,6 +158,20 @@ def _one(code, start, addr):
         second = code[index + 1]
         if 0x80 <= second <= 0x8F:
             raise Reject("jcc")
+        if second in (0x28, 0x29):
+            xreg, kind, cursor = _modrm(code, index + 2, addr, start, rex_r, rex_b, rex_x)
+            if not 0 <= xreg < 16:
+                raise Reject("unsupported")
+            if kind[0] == "reg":
+                if not 0 <= kind[1] < 16:
+                    raise Reject("unsupported")
+                if second == 0x28:
+                    return finish("movaps", cursor, [], [], xmm=(xreg, kind[1]))
+                return finish("movaps", cursor, [], [], xmm=(kind[1], xreg))
+            if kind[0] not in ("rsp", "base"):
+                raise Reject("memory_form")
+            slot = _slot(kind, 16, "load" if second == 0x28 else "store")
+            return finish("movaps", cursor, slot[0], [], mem=slot[1], xmm=(xreg, None))
         if second not in (0xB6, 0xB7) or opsize16:
             raise Reject("unsupported")
         reg, kind, cursor = _modrm(code, index + 2, addr, start, rex_r, rex_b, rex_x)
@@ -184,6 +200,20 @@ def _one(code, start, addr):
         _need(code, index + 1, 4)
         return finish("add", index + 5, [(0, bits)], [(0, bits)])
 
+    if op == 0xC7:
+        ext, kind, cursor = _modrm(code, index + 1, addr, start, rex_r, rex_b, rex_x)
+        if ext != 0 or kind[0] not in ("rsp", "base"):
+            raise Reject("unsupported" if kind[0] == "reg" else "memory_form")
+        if opsize16:
+            raise Reject("unsupported")
+        _need(code, cursor, 4)
+        raw = int.from_bytes(code[cursor:cursor + 4], "little")
+        if rex_w:
+            size, imm = 8, _sext(raw, 32)
+        else:
+            size, imm = 4, raw & 0xFFFFFFFF
+        reads, slot = _slot(kind, size, "store")
+        return finish("mov", cursor + 4, reads, [], mem=slot, imm=imm)
     if op == 0x2D:
         bits = width()
         _need(code, index + 1, 4)
@@ -263,21 +293,27 @@ def _one(code, start, addr):
             if shape == "rm":
                 return finish(mnemonic, disp_end, [(reg, bits)], [], rip)
             return finish(mnemonic, disp_end, [], [(reg, bits)], rip)
-        if kind[0] in ("base",):
-            raise Reject("memory_form")
-        if kind[0] == "rsp":
-            if bits != 64:
+        if kind[0] in ("rsp", "base"):
+            if bits not in (8, 16, 32, 64):
                 raise Reject("memory_form")
-            disp = kind[1]
-            slot = ("rsp", disp, 8, "store" if shape == "rm" else "load")
+            access = "store" if shape == "rm" else "load"
+            reads, slot = _slot(kind, bits // 8, access)
             if shape == "rm":
-                return finish(mnemonic, cursor, [(reg, bits), (4, 64)], [], mem=slot)
-            return finish(mnemonic, cursor, [(4, 64)], [(reg, bits)], mem=slot)
+                return finish(mnemonic, cursor, reads + [(reg, bits)], [], mem=slot)
+            return finish(mnemonic, cursor, reads, [(reg, bits)], mem=slot)
         _gpr(kind[1], bits, rex is not None)
         if shape == "rm":
             return finish(mnemonic, cursor, [(reg, bits)], [(kind[1], bits)])
         return finish(mnemonic, cursor, [(kind[1], bits)], [(reg, bits)])
     raise Reject("unsupported")
+
+
+def _slot(kind, size, access):
+    if kind[0] == "rsp":
+        return [(4, 64)], ("rsp", kind[1], size, access)
+    if kind[0] == "base":
+        return [(kind[1], 64)], ("base", kind[1], kind[2], size, access)
+    raise Reject("memory_form")
 
 
 def _sext(value, bits):

@@ -26,9 +26,10 @@ static inline void *memcpy(void *dst, const void *src, unsigned long n) {
 typedef struct __attribute__((packed)) {
     uint64_t r[16]; /* rax rcx rdx rbx rsp rbp rsi rdi r8..r15 */
     uint32_t cf, pf, af, zf, sf, of;
+    uint64_t xmm[16][2]; /* [0] is the low 64 bits, little-endian memory order */
 } Cpu64;
 
-_Static_assert(sizeof(Cpu64) == 152, "Cpu64 layout");
+_Static_assert(sizeof(Cpu64) == 408, "Cpu64 layout");
 
 static inline uint32_t parity_even(uint64_t v) {
     return (uint32_t)((__builtin_parityll(v & 0xffu) ^ 1) & 1);
@@ -100,6 +101,21 @@ static inline uint64_t ld(const uint8_t *mem, uint64_t addr, int nbytes) {
 static inline void st(uint8_t *mem, uint64_t addr, uint64_t value, int nbytes) {
     if (nbytes < 1 || nbytes > 8 || addr > (uint64_t)MEMSZ - (uint64_t)nbytes) abort();
     memcpy(mem + addr, &value, (size_t)nbytes);
+}
+
+static inline void xmm_copy(Cpu64 *c, int dst, int src) {
+    c->xmm[dst][0] = c->xmm[src][0];
+    c->xmm[dst][1] = c->xmm[src][1];
+}
+
+static inline void xmm_store(Cpu64 *c, int src, uint8_t *mem, uint64_t addr) {
+    if ((addr & 15u) || addr > (uint64_t)MEMSZ - 16u) abort();
+    memcpy(mem + addr, &c->xmm[src][0], 16);
+}
+
+static inline void xmm_load(Cpu64 *c, int dst, const uint8_t *mem, uint64_t addr) {
+    if ((addr & 15u) || addr > (uint64_t)MEMSZ - 16u) abort();
+    memcpy(&c->xmm[dst][0], mem + addr, 16);
 }
 
 #endif

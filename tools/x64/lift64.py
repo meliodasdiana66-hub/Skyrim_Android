@@ -11,7 +11,7 @@ MAX_CODE = 4096
 
 ALLOW = frozenset({
     "nop", "mov", "movabs", "movzx", "add", "sub", "cmp", "and", "or", "xor", "test",
-    "push", "pop", "lea",
+    "push", "pop", "lea", "movaps",
 })
 
 _WIDTHS = (
@@ -60,6 +60,16 @@ def _prefixes(insn):
         raise Unsupported("segment override rejected at %#x" % insn.address)
     if addrsize:
         raise Unsupported("address-size override rejected at %#x" % insn.address)
+
+
+def _xmm(insn, op):
+    name = insn.reg_name(op.reg)
+    if not name.startswith("xmm"):
+        raise Unsupported("expected xmm register at %#x" % insn.address)
+    number = int(name[3:])
+    if not 0 <= number < 16:
+        raise Unsupported("xmm register rejected at %#x" % insn.address)
+    return number
 
 
 def _reg(insn, op):
@@ -161,6 +171,19 @@ def _emit(insn):
     if len(ops) != 2:
         raise Unsupported("operand form rejected at %#x" % insn.address)
     dst, src = ops
+    if mn == "movaps":
+        if len(ops) != 2:
+            raise Unsupported("movaps form rejected at %#x" % insn.address)
+        dst, src = ops
+        if dst.type == x86.X86_OP_REG and src.type == x86.X86_OP_REG:
+            return [comment, "xmm_copy(c, %d, %d);" % (_xmm(insn, dst), _xmm(insn, src))]
+        if dst.type == x86.X86_OP_REG and src.type == x86.X86_OP_MEM:
+            ea, _sz = _mem(insn, src)
+            return [comment, "xmm_load(c, %d, mem, %s);" % (_xmm(insn, dst), ea)]
+        if dst.type == x86.X86_OP_MEM and src.type == x86.X86_OP_REG:
+            ea, _sz = _mem(insn, dst)
+            return [comment, "xmm_store(c, %d, mem, %s);" % (_xmm(insn, src), ea)]
+        raise Unsupported("movaps form rejected at %#x" % insn.address)
     if mn == "lea":
         if len(ops) != 2 or ops[0].type != x86.X86_OP_REG or ops[1].type != x86.X86_OP_MEM:
             raise Unsupported("lea form rejected at %#x" % insn.address)
@@ -191,6 +214,11 @@ def _emit(insn):
             if sz * 8 != sb:
                 raise Unsupported("mov store width rejected at %#x" % insn.address)
             return [comment, "st(mem, %s, rd(c, %d, %d), %d);" % (ea, si, sb, sz)]
+        if dst.type == x86.X86_OP_MEM and src.type == x86.X86_OP_IMM:
+            ea, sz = _mem(insn, dst)
+            if sz not in (1, 2, 4, 8):
+                raise Unsupported("mov immediate width rejected at %#x" % insn.address)
+            return [comment, "st(mem, %s, %#xull, %d);" % (ea, src.imm & ((1 << (sz * 8)) - 1), sz)]
         raise Unsupported("mov form rejected at %#x" % insn.address)
     if mn == "movzx":
         if dst.type != x86.X86_OP_REG or src.type != x86.X86_OP_REG:

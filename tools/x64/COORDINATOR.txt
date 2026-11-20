@@ -19,6 +19,6 @@ This revision:
   One push/pop snippet was executed under qemu-aarch64-static on the development VM. That is QEMU user-mode, not a phone, not Adreno, and not the game binary.
   The standalone package skips the 2011 regression instead of failing or calling it a pass. The full repository still runs that regression.
 
-`sub rsp, imm` and selected LEA forms are now in the lifter. They will not make functions with calls or branches runnable. Logical intervals describe the 59 MiB image without allocating it and without copying section bytes. See ROADMAP.md.
+Run 5: 214/214 leaves, 856/856 match. Logical map: 20 intervals, full SizeOfImage 59179008, nothing executed. The common reject `mov [rsp], imm` was opcode C7, which the allowlist did not contain; 32-bit `mov [rsp], reg` was rejected as the wrong width. Both are now accepted only inside a proven frame. `movaps` requires a 16-byte-aligned address. Unicorn on this build does not trap an unaligned MOVAPS, so the scanner rejects that address instead of comparing it. A pointer is stored through only if this leaf computed it from the frame. An incoming register is not a sandbox. A synthetic caller/callee sum matches Unicorn; the leaf scanner still rejects `call`. See ROADMAP.md.
 
 Still unsupported for a playable port: calls, branches, untracked memory, indexed LEA, LOCK, RSP push/pop, D3D11/DXGI binding, TLS callbacks, exception dispatch, audio, BSA/ESM, and any ARM64 Android run of the game.

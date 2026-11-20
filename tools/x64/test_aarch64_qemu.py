@@ -83,6 +83,60 @@ void _start(void) {
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertEqual(run.stdout.strip(), "1122334455667788 000000000000e000")
 
+    def test_sign_extending_stack_store_under_qemu(self):
+        body = lift64.lift_snippet(bytes.fromhex("48c7042400000080"), 0x4000)
+        src = r'''
+#define AE_FREESTANDING 1
+#define MEMSZ 65536
+#include "snippet_rt.h"
+%s
+static void putbuf(const char *s, unsigned long n) {
+    register unsigned long x0 __asm__("x0") = 1;
+    register unsigned long x1 __asm__("x1") = (unsigned long)s;
+    register unsigned long x2 __asm__("x2") = n;
+    register unsigned long x8 __asm__("x8") = 64;
+    __asm__ volatile("svc #0" :: "r"(x0), "r"(x1), "r"(x2), "r"(x8) : "memory");
+}
+static void hex64(unsigned long v) {
+    char b[16];
+    int i;
+    for (i = 15; i >= 0; i--) { b[i] = "0123456789abcdef"[v & 15]; v >>= 4; }
+    putbuf(b, 16);
+}
+static void driver(void) {
+    static unsigned char mem[MEMSZ];
+    Cpu64 c;
+    int i;
+    for (i = 0; i < 16; i++) c.r[i] = 0;
+    c.r[4] = 0xE000ull;
+    snippet(&c, mem);
+    hex64(*(unsigned long *)(mem + 0xE000));
+    putbuf("\n", 1);
+}
+void _start(void) {
+    driver();
+    register unsigned long x0 __asm__("x0") = 0;
+    register unsigned long x8 __asm__("x8") = 93;
+    __asm__ volatile("svc #0" :: "r"(x0), "r"(x8));
+    __builtin_trap();
+}
+''' % body
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            (td / "run.c").write_text(src)
+            obj, elf = td / "run.o", td / "run.elf"
+            cc = subprocess.run(
+                ["clang", "--target=aarch64-linux-gnu", "-nostdinc", "-ffreestanding",
+                 "-fno-stack-protector", "-O2", "-I", str(HERE), "-c", str(td / "run.c"), "-o", str(obj)],
+                capture_output=True, text=True, check=False)
+            self.assertEqual(cc.returncode, 0, cc.stderr)
+            ld = subprocess.run(["ld.lld", "-m", "aarch64linux", "-e", "_start", str(obj), "-o", str(elf)],
+                                capture_output=True, text=True, check=False)
+            self.assertEqual(ld.returncode, 0, ld.stderr)
+            run = subprocess.run([QEMU, str(elf)], capture_output=True, text=True, check=False)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(run.stdout.strip(), "ffffffff80000000")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
