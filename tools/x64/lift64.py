@@ -9,7 +9,10 @@ from capstone import x86
 
 MAX_CODE = 4096
 
-ALLOW = frozenset({"nop", "mov", "movabs", "movzx", "add", "sub", "cmp", "and", "or", "xor", "test"})
+ALLOW = frozenset({
+    "nop", "mov", "movabs", "movzx", "add", "sub", "cmp", "and", "or", "xor", "test",
+    "push", "pop",
+})
 
 _WIDTHS = (
     (64, ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
@@ -130,6 +133,31 @@ def _emit(insn):
         if ops:
             raise Unsupported("nop form rejected at %#x" % insn.address)
         return [comment]
+    if mn == "push":
+        if len(ops) != 1:
+            raise Unsupported("push form rejected at %#x" % insn.address)
+        src = ops[0]
+        if src.type == x86.X86_OP_REG:
+            index, bits = _reg(insn, src)
+            if bits != 64 or index == 4:
+                raise Unsupported("push form rejected at %#x" % insn.address)
+            stored = "rd(c, %d, 64)" % index
+        elif src.type == x86.X86_OP_IMM:
+            stored = "%#xull" % (src.imm & 0xFFFFFFFFFFFFFFFF)
+        else:
+            raise Unsupported("push form rejected at %#x" % insn.address)
+        return [comment,
+                "wr(c, 4, rd(c, 4, 64) - 8, 64);",
+                "st(mem, rd(c, 4, 64), %s, 8);" % stored]
+    if mn == "pop":
+        if len(ops) != 1 or ops[0].type != x86.X86_OP_REG:
+            raise Unsupported("pop form rejected at %#x" % insn.address)
+        index, bits = _reg(insn, ops[0])
+        if bits != 64 or index == 4:
+            raise Unsupported("pop form rejected at %#x" % insn.address)
+        return [comment,
+                "wr(c, %d, ld(mem, rd(c, 4, 64), 8), 64);" % index,
+                "wr(c, 4, rd(c, 4, 64) + 8, 64);"]
     if len(ops) != 2:
         raise Unsupported("operand form rejected at %#x" % insn.address)
     dst, src = ops

@@ -17,7 +17,12 @@ import inspect_pe32plus
 
 MEMSZ = 0x10000
 MAX_LEAF = 4096
-MAX_REPORTED = 64
+DEFAULT_MAX_REPORT = 64
+DEFAULT_MAX_FUNCTIONS = 64
+DEFAULT_MAX_CASES = 4
+SAFETY_CAP = 4096
+STACK_LO = 0xC000
+STACK_TOP = 0xE000
 EXPECTED_SHA = "21a6f8244a57e880d02e600adf61178ab5483db7b3cca8dbfc97d7ca1f081e18"
 
 CASES = (
@@ -44,6 +49,59 @@ def _guest_base(span_lo, span_hi):
             return 0
         return None
     return base
+
+
+def _analyze_stack(insns):
+    """Prove push/pop and [rsp+disp] stay inside the frame this leaf allocated.
+
+    Returns None when the leaf does not touch the stack. A string is a rejection
+    reason. A dict means RSP must be pinned to STACK_TOP for execution.
+    """
+    stackish = any(insn.get("stack") or (insn.get("mem") or [None])[0] == "rsp" for insn in insns)
+    if not stackish:
+        return None
+    delta = 0
+    deepest = 0
+    for insn in insns:
+        if insn["mnemonic"] == "ret":
+            continue
+        if insn["mnemonic"] == "add" and any(index == 4 for index, _bits in insn["writes"]):
+            if "imm" not in insn:
+                return "rsp_untracked"
+            delta += insn["imm"]
+            if delta > 0:
+                return "stack_underflow"
+            if STACK_TOP + delta < STACK_LO:
+                return "stack_window"
+            deepest = min(deepest, delta)
+            continue
+        if any(index == 4 for index, _bits in insn["writes"]) and not insn.get("stack"):
+            return "rsp_untracked"
+        if insn["mnemonic"] == "mov" and any(index == 4 for index, _bits in insn["reads"]) and not insn.get("mem"):
+            return "rsp_untracked"
+        stack = insn.get("stack")
+        if stack:
+            if stack[0] == "push":
+                delta -= stack[1]
+                if STACK_TOP + delta < STACK_LO:
+                    return "stack_window"
+                deepest = min(deepest, delta)
+                continue
+            if stack[0] == "pop":
+                if delta >= 0:
+                    return "stack_underflow"
+                delta += stack[1]
+                continue
+        mem = insn.get("mem")
+        if mem and mem[0] == "rsp":
+            _base, disp, nbytes, _kind = mem
+            lo = STACK_TOP + delta + disp
+            hi = lo + nbytes
+            frame_lo = STACK_TOP + delta
+            if not (frame_lo <= lo and hi <= STACK_TOP):
+                return "stack_external"
+            continue
+    return {"pinnedRsp": STACK_TOP, "maxDepth": -deepest}
 
 
 def _inputs(insns):
@@ -116,16 +174,26 @@ def _consider(data, sections, image_base, entry, begin, end):
     guest = _guest_base(span_lo, span_hi)
     if guest is None:
         return "window_too_wide", None
+    stack = _analyze_stack(insns)
+    if isinstance(stack, str):
+        return stack, None
+    if stack:
+        for rel, blob in copies:
+            addr = guest + rel
+            if addr < STACK_TOP and addr + len(blob) > STACK_LO:
+                return "window_conflict", None
     logical = any(insn["mnemonic"] in ("and", "or", "xor", "test") for insn in insns)
+    inputs = [name for name in _inputs(insns) if not (stack and name == "rsp")]
     public = {
         "rva": begin,
         "endRva": end,
         "size": size,
         "section": sec["name"],
         "instructionCount": len(insns) - 1,
-        "registerInputs": _inputs(insns),
+        "registerInputs": inputs,
         "ripRvas": rip_rvas,
         "guestBase": guest,
+        "stackPinned": bool(stack),
         "status": "candidate_not_executed",
     }
     private = {
@@ -133,11 +201,22 @@ def _consider(data, sections, image_base, entry, begin, end):
         "guest": guest,
         "copies": [(guest + rel, blob) for rel, blob in copies],
         "compare_af": not logical,
+        "stack": stack,
     }
     return None, (public, private)
 
 
-def scan_image(data):
+def _limit(value, default):
+    if value is None:
+        return default
+    if value < 0:
+        raise ValueError("limits must be >= 0")
+    return value
+
+
+def scan_image(data, max_report=DEFAULT_MAX_REPORT, max_functions=DEFAULT_MAX_FUNCTIONS):
+    max_report = _limit(max_report, DEFAULT_MAX_REPORT)
+    max_functions = _limit(max_functions, DEFAULT_MAX_FUNCTIONS)
     info = inspect_pe32plus.inspect_bytes(data)
     sections = info["sections"]
     entry = info["addressOfEntryPoint"]
@@ -145,6 +224,8 @@ def scan_image(data):
     reasons = Counter()
     candidates = []
     plans = []
+    found = 0
+    safety_hit = False
     pdata_entries = 0
     if not exc["present"] or exc["size"] < 12:
         reasons["no_exception_directory"] += 1
@@ -173,13 +254,20 @@ def scan_image(data):
                 reason, plan = _consider(data, sections, info["imageBase"], entry, begin, end)
                 if reason:
                     reasons[reason] += 1
-                else:
-                    public, private = plan
-                    if len(candidates) < MAX_REPORTED:
+                    continue
+                found += 1
+                public, private = plan
+                keep_any = (max_report == 0 or len(candidates) < max_report or
+                            max_functions == 0 or len(plans) < max_functions)
+                if keep_any and found > SAFETY_CAP and (max_report == 0 or max_functions == 0):
+                    safety_hit = True
+                    continue
+                if max_report == 0 or len(candidates) < max_report:
+                    if not (safety_hit and max_report == 0):
                         candidates.append(public)
-                        plans.append(private)
-                    else:
-                        reasons["candidates_omitted"] += 1
+                if max_functions == 0 or len(plans) < max_functions:
+                    if not (safety_hit and max_functions == 0):
+                        plans.append({"public": public, "private": private})
     report = {
         "tool": "leafcheck",
         "mode": "dry-run",
@@ -192,13 +280,20 @@ def scan_image(data):
         "pdataEntries": pdata_entries,
         "executed": False,
         "verifiedFunctions": [],
-        "candidates": candidates,
+        "candidatesFound": found,
         "candidatesReported": len(candidates),
+        "functionsSelected": len(plans),
+        "maxReport": max_report,
+        "maxFunctions": max_functions,
+        "safetyCap": SAFETY_CAP if safety_hit else None,
+        "candidates": candidates,
         "rejectionCounts": dict(sorted(reasons.items())),
         "note": (
             "candidates are scanner results and were not executed. "
-            "A function is verified only when it appears in verifiedFunctions "
-            "after --execute. Entry point and .bind ranges are not leaves. "
+            "candidatesFound is the full total. candidatesReported and functionsSelected "
+            "are independent caps; omission is not a rejection. "
+            "A function is verified only when it appears in verifiedFunctions after --execute. "
+            "Entry point, .bind, calls, jumps, and unproven memory stay rejected. "
             "The final ret is a terminator and is not executed. "
             "This report contains no instruction or data bytes."
         ),
@@ -230,10 +325,28 @@ def _mismatch_fields(message):
     return fields
 
 
-def execute_plans(report, plans):
+def _case_list(stack, max_cases):
+    if max_cases < 1:
+        raise ValueError("max_cases must be >= 1")
+    if not stack:
+        return list(CASES[:max_cases])
+    pinned = stack["pinnedRsp"]
+    seeds = (
+        {"name": "zeros", "regs": {"rsp": pinned}},
+        {"name": "ones", "fill": 1, "regs": {"rsp": pinned}},
+        {"name": "high", "regs": {"rax": 0xFFFFFFFFFFFFFFFF, "rcx": 0x8000000000000000, "rsp": pinned}},
+        {"name": "varied", "cf": 1, "regs": {
+            "rax": 0x1122334455667788, "rbx": 0x0102030405060708, "rsp": pinned}},
+    )
+    return list(seeds[:max_cases])
+
+
+def execute_plans(report, plans, max_cases=DEFAULT_MAX_CASES):
     import difftest64
     verified = []
-    for public, private in zip(report["candidates"], plans):
+    for item in plans:
+        public = item["public"]
+        private = item["private"]
         code = private["code"]
         guest = private["guest"]
         mem = bytearray(difftest64.MEMSZ)
@@ -242,7 +355,7 @@ def execute_plans(report, plans):
             mem[addr:addr + len(blob)] = blob
         cases = []
         status = "verified_match"
-        for spec in CASES:
+        for spec in _case_list(private.get("stack"), max_cases):
             cpu = _case_cpu(spec)
             try:
                 difftest64.compare(code, guest, cpu, mem, compare_af=private["compare_af"])
@@ -267,9 +380,12 @@ def execute_plans(report, plans):
     report["note"] = (
         "verifiedFunctions are Unicorn versus lifted-C results for scanner candidates. "
         "candidate status stays candidate_not_executed. "
-        "match does not mean the game runs. The final ret was not executed. "
+        "match does not mean the game runs and is not an ARM64 or Android result. "
+        "The final ret was not executed. Stack leaves pin RSP inside the guest window. "
         "No instruction or data bytes are included."
     )
+    report["casesPerFunction"] = max_cases
+    report["functionsExecuted"] = len(verified)
     return report
 
 
@@ -280,6 +396,12 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--report", help="write JSON here instead of stdout")
+    parser.add_argument("--max-report", type=int, default=DEFAULT_MAX_REPORT,
+                        help="detailed candidate rows in JSON; 0 keeps up to the safety cap")
+    parser.add_argument("--max-functions", type=int, default=DEFAULT_MAX_FUNCTIONS,
+                        help="how many candidates --execute may run; 0 means up to the safety cap")
+    parser.add_argument("--max-cases", type=int, default=DEFAULT_MAX_CASES,
+                        help="deterministic input cases per executed function")
     args = parser.parse_args(argv)
     if args.execute and args.dry_run:
         print("choose only one of --dry-run and --execute", file=sys.stderr)
@@ -297,13 +419,16 @@ def main(argv=None):
         print("sha256 mismatch", file=sys.stderr)
         return 3
     try:
-        report, plans = scan_image(data)
+        report, plans = scan_image(data, max_report=args.max_report, max_functions=args.max_functions)
     except inspect_pe32plus.PeFormatError as exc:
         print("pe: %s" % exc, file=sys.stderr)
         return 2
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     if args.execute:
         try:
-            execute_plans(report, plans)
+            execute_plans(report, plans, max_cases=args.max_cases)
         except ImportError:
             print("execute needs capstone, unicorn, and clang; dry-run does not install them", file=sys.stderr)
             return 4

@@ -187,6 +187,58 @@ class LeafScanTests(unittest.TestCase):
             self.assertEqual([row["rva"] for row in got["candidates"]], [0x1000, 0x1300])
 
 
+def tiny_executable(chunks, entry=0x1F00):
+    """chunks: list of (rva, bytes) inside .text."""
+    data = bytearray(build_synthetic())
+    # wipe the previous pdata and text leaves, then install the requested ones
+    data[0x400:0xC00] = b"\0" * 0x800
+    data[0xE00:0x1000] = b"\0" * 0x200
+    for rva, code in chunks:
+        data[0x400 + (rva - 0x1000):0x400 + (rva - 0x1000) + len(code)] = code
+    for n, (rva, code) in enumerate(chunks):
+        at = 0xE00 + n * 12
+        data[at:at + 4] = struct.pack("<I", rva)
+        data[at + 4:at + 8] = struct.pack("<I", rva + len(code))
+    # exception directory size was 60; point it at the new count
+    opt = 0x84 + 20
+    count = len(chunks)
+    data[opt + 112 + 3 * 8:opt + 112 + 3 * 8 + 8] = struct.pack("<II", 0x3000, count * 12)
+    data[opt + 16:opt + 20] = struct.pack("<I", entry)
+    return bytes(data)
+
+
+class CapAndStackTests(unittest.TestCase):
+    def test_report_cap_does_not_limit_the_execute_selection(self):
+        chunks = []
+        for i, rva in enumerate((0x1000, 0x1100, 0x1200)):
+            chunks.append((rva, bytes.fromhex("b8%02x000000c3" % (i + 1))))
+        blob = tiny_executable(chunks)
+        report, plans = leafcheck.scan_image(blob, max_report=1, max_functions=2)
+        self.assertEqual(report["candidatesFound"], 3)
+        self.assertEqual(report["candidatesReported"], 1)
+        self.assertEqual(report["functionsSelected"], 2)
+        self.assertNotIn("candidates_omitted", report["rejectionCounts"])
+        leafcheck.execute_plans(report, plans, max_cases=2)
+        self.assertEqual(len(report["verifiedFunctions"]), 2)
+        self.assertEqual(len(report["candidates"]), 1)
+        self.assertTrue(all(row["status"] == "verified_match" for row in report["verifiedFunctions"]))
+        self.assertEqual(len(report["verifiedFunctions"][0]["cases"]), 2)
+
+    def test_push_pop_leaf_is_pinned_and_bare_pop_is_rejected(self):
+        good = tiny_executable([(0x1000, bytes.fromhex("5059c3"))])
+        report, plans = leafcheck.scan_image(good)
+        self.assertEqual(report["candidatesFound"], 1)
+        self.assertTrue(report["candidates"][0]["stackPinned"])
+        self.assertNotIn("5059c3", json.dumps(report))
+        leafcheck.execute_plans(report, plans)
+        self.assertEqual(report["verifiedFunctions"][0]["status"], "verified_match")
+        self.assertEqual(len(report["verifiedFunctions"][0]["cases"]), 4)
+        bad = tiny_executable([(0x1000, bytes.fromhex("58c3"))])
+        rejected, _plans = leafcheck.scan_image(bad)
+        self.assertEqual(rejected["candidatesFound"], 0)
+        self.assertGreaterEqual(rejected["rejectionCounts"].get("stack_underflow", 0), 1)
+
+
 class AArch64AvailabilityTests(unittest.TestCase):
     def test_freestanding_c_compiles_for_aarch64_and_is_not_run(self):
         """Object codegen only. No QEMU invocation and no Android device."""

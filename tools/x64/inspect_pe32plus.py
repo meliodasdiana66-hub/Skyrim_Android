@@ -173,6 +173,7 @@ def inspect_bytes(data):
     sections = _sections(data, opt + optsize, nsec)
     imports = _imports(data, sections, directories)
     exception = directories[3] if len(directories) > 3 else (0, 0)
+    reloc = directories[5] if len(directories) > 5 else (0, 0)
     utc = datetime.datetime.fromtimestamp(stamp, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     return {
         "machine": "IMAGE_FILE_MACHINE_AMD64",
@@ -200,6 +201,11 @@ def inspect_bytes(data):
             "present": bool(exception[0] or exception[1]),
             "virtualAddress": exception[0],
             "size": exception[1],
+        },
+        "baseRelocation": {
+            "present": bool(reloc[0] or reloc[1]),
+            "virtualAddress": reloc[0],
+            "size": reloc[1],
         },
         "bindSection": {
             "present": any(sec["name"] == ".bind" for sec in sections),

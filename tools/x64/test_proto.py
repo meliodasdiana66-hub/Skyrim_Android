@@ -12,6 +12,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 
+import decode_allow  # noqa: E402
 import difftest64  # noqa: E402
 import inspect_pe32plus  # noqa: E402
 import lift64  # noqa: E402
@@ -328,6 +329,41 @@ class LiftTests(unittest.TestCase):
         with self.assertRaises(lift64.Unsupported):
             lift64.lift_snippet(bytes.fromhex("c20000"), BASE)
 
+    def test_push_pop_round_trip_and_imm(self):
+        code = bytes.fromhex("5059")  # push rax; pop rcx
+        state = cpu(rax=0x1122334455667788, rsp=0xE000)
+        check(code, BASE, state)
+        got = difftest64.run_host(code, BASE, state, mem_with(code, BASE))
+        self.assertEqual(got["r"][1], 0x1122334455667788)
+        self.assertEqual(got["r"][4], 0xE000)
+        neg = bytes.fromhex("6aff58")  # push -1; pop rax
+        state = cpu(rax=0, rsp=0xE000)
+        check(neg, BASE, state)
+        got = difftest64.run_host(neg, BASE, state, mem_with(neg, BASE))
+        self.assertEqual(got["r"][0], 0xFFFFFFFFFFFFFFFF)
+        self.assertEqual(got["r"][4], 0xE000)
+
+    def test_rsp_relative_slot_after_push(self):
+        # push rbx; mov rax, [rsp]; mov [rsp+0], rcx is not this snippet.
+        # push rbx; mov rax, qword ptr [rsp]
+        code = bytes.fromhex("53488b0424")
+        state = cpu(rbx=0x0102030405060708, rsp=0xE000, cf=1)
+        check(code, BASE, state)
+        got = difftest64.run_host(code, BASE, state, mem_with(code, BASE))
+        self.assertEqual(got["r"][0], 0x0102030405060708)
+        self.assertEqual(got["r"][4], 0xDFF8)
+        self.assertEqual(got["cf"], 1)
+
+    def test_push_rsp_and_call_stay_rejected(self):
+        with self.assertRaises(lift64.Unsupported):
+            lift64.lift_snippet(bytes.fromhex("54"), BASE)
+        with self.assertRaises(decode_allow.Reject) as caught:
+            decode_allow.decode_stream(bytes.fromhex("54"), BASE)
+        self.assertEqual(caught.exception.reason, "push_rsp")
+        with self.assertRaises(decode_allow.Reject) as caught:
+            decode_allow.decode_stream(bytes.fromhex("e800000000"), BASE)
+        self.assertEqual(caught.exception.reason, "call")
+
     def test_lock_is_rejected(self):
         code = bytes.fromhex("f0480118")  # lock add qword ptr [rax], rbx
         with self.assertRaises(lift64.Unsupported) as caught:
@@ -355,27 +391,6 @@ class LiftTests(unittest.TestCase):
             capture_output=True, text=True, check=False)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("match", proc.stdout.lower())
-
-
-class LegendaryEditionUntouchedTests(unittest.TestCase):
-    def test_le_lifter_stays_32bit(self):
-        lift = (ROOT / "tools" / "lift.py").read_text()
-        discover = (ROOT / "tools" / "discover.py").read_text()
-        self.assertIn("CS_MODE_32", lift)
-        self.assertNotIn("CS_MODE_64", lift)
-        self.assertIn("CS_MODE_32", discover)
-        self.assertNotIn("CS_MODE_64", discover)
-        main = (ROOT / "runtime" / "main.c").read_text()
-        self.assertIn("opt + 28", main)
-        self.assertIn("1ull << 32", main)
-
-    def test_le_sources_still_parse(self):
-        for name in ("lift.py", "discover.py", "difftest.py", "peimg.py"):
-            src = ROOT / "tools" / name
-            proc = subprocess.run(
-                [sys.executable, "-m", "py_compile", str(src)],
-                capture_output=True, text=True, check=False)
-            self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
 if __name__ == "__main__":

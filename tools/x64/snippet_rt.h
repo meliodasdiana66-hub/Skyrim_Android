@@ -2,9 +2,23 @@
  * This is not a game loader. MEMSZ is a 64 KiB identity-mapped guest window. */
 #ifndef SNIPPET_RT_H
 #define SNIPPET_RT_H
+#ifdef AE_FREESTANDING
+typedef unsigned char uint8_t;
+typedef unsigned int uint32_t;
+typedef unsigned long size_t;
+typedef unsigned long long uint64_t;
+static inline void abort(void) { __builtin_trap(); }
+static inline void *memcpy(void *dst, const void *src, unsigned long n) {
+    unsigned char *d = dst;
+    const unsigned char *s = src;
+    while (n--) *d++ = *s++;
+    return dst;
+}
+#else
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#endif
 #ifndef MEMSZ
 #error MEMSZ required
 #endif

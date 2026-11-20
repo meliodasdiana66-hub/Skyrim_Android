@@ -14,6 +14,7 @@ A match here means clang `-O2` produced the same registers, defined flags, and m
 | `movzx` | reg, reg |
 | `add` | reg, reg; reg, imm |
 | `sub`, `and`, `or`, `xor`, `cmp`, `test` | reg, reg |
+| `push` / `pop` | r64 except RSP; `push imm8` and `push imm32` sign-extended to 64. A leaf may use them only inside a proven frame |
 
 Widths are 8, 16, 32, and 64. A 32-bit write zero-extends. An 8- or 16-bit write keeps the upper bits. `R8`–`R15` use the same paths as `RAX`–`RDI`. RIP-relative `mov` uses `insn_end + disp32`. Other memory forms are base register plus a displacement, with no index and no segment.
 
@@ -32,6 +33,7 @@ The lifter raises `Unsupported` and emits no runnable function for:
 - high-byte registers `AH`/`CH`/`DH`/`BH`
 - indexed memory, absolute memory, and ALU or `movzx` memory forms not listed above
 - `syscall`, calls, jumps, and every other mnemonic
+- `push`/`pop` of RSP, 16-bit `push`/`pop`, and any stack access outside the frame this leaf allocated
 - any `ret` except one final unprefixed `C3`, which is recognized and then not executed
 
 `inspect_pe32plus.py` and `leafcheck.py` are the tools that open a PE. They accept `IMAGE_FILE_MACHINE_AMD64` and magic `0x20B` only. `ImageBase` is the 8-byte field at optional-header offset 24. Import thunks are 8 bytes, read from the data directory at optional-header offset 112. The entry-point RVA is printed and not disassembled. A `.bind` section is reported as a section; its presence or absence is not evidence that bytes are encrypted or decrypted.
@@ -71,7 +73,7 @@ Owner-supplied structural identity for that file, not re-parsed here: 37157376 b
 - the range does not contain `addressOfEntryPoint`
 - the bytes decode as an allowlisted straight line of at most 4096 bytes, at least one instruction, and a final one-byte `ret`
 - there is no call, jump, `LOCK`, or other rejected opcode
-- every memory operand is RIP-relative, the target is inside a non-`.bind` section that has raw file bytes, and the code plus those targets fit in the 64 KiB window after a slide that preserves displacements
+- every memory operand is either RIP-relative inside the 64 KiB window or `[rsp+disp]` / `push` / `pop` inside a frame this leaf itself allocated. RSP is then pinned. Calls, jumps, and other addresses stay rejected.
 
 A row in `candidates` has `status: candidate_not_executed`. That is not a test result. `verifiedFunctions` is filled only by `--execute`, which needs capstone, unicorn, and clang already installed and runs four deterministic register/flag cases. Do not install those packages for this step unless that has been agreed. `--execute` still does not launch the game, does not unpack `.bind`, and does not write instruction or data bytes into the JSON.
 
@@ -79,4 +81,4 @@ The Anniversary Edition file was not on the machine that added this tool, so no 
 
 ## AArch64
 
-Clang on the development VM can emit AArch64 object code (`--target=aarch64-linux-gnu -nostdinc -ffreestanding`). `snippet_rt.h` was not cross-compiled: the AArch64 C library headers are not installed (`bits/libc-header-start.h` is missing). `qemu-aarch64` is not installed. Nothing was executed under QEMU, and QEMU user-mode would not be a physical ARM64 Android device in any case. No phone or Adreno GPU was used.
+`test_aarch64_qemu.py` cross-compiles one lifted `push rax; pop rcx` snippet with `clang --target=aarch64-linux-gnu -nostdinc` and runs that ELF under `qemu-aarch64-static`. That is QEMU user-mode on the build machine. It is not a physical ARM64 device, not Android, and not Adreno. The game executable is not involved. Host C library headers for AArch64 are still absent; the freestanding path defines its own types.
