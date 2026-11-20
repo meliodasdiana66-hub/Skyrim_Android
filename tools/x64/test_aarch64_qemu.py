@@ -319,5 +319,74 @@ void _start(void) {
                 self.assertEqual(run.returncode, 0, run.stderr)
                 self.assertEqual(run.stdout.strip(), "0000000000000022")
 
+    def test_guest_token_dispatch_under_qemu_user_mode(self):
+        src = r'''
+#include "ae_iat.h"
+#include "ae_dispatch.c"
+static void putbuf(const char *s, unsigned long n) {
+    register unsigned long x0 __asm__("x0") = 1;
+    register unsigned long x1 __asm__("x1") = (unsigned long)s;
+    register unsigned long x2 __asm__("x2") = n;
+    register unsigned long x8 __asm__("x8") = 64;
+    __asm__ volatile("svc #0" :: "r"(x0), "r"(x1), "r"(x2), "r"(x8) : "memory");
+}
+static void hex64(unsigned long v) {
+    char b[16];
+    int i;
+    for (i = 15; i >= 0; i--) { b[i] = "0123456789abcdef"[v & 15]; v >>= 4; }
+    putbuf(b, 16);
+}
+static void driver(void) {
+    AeImport item;
+    AeProcess proc;
+    uint64_t token = ae_guest_token(AE_TOKEN_CALL, 65599u);
+    uint64_t result = 0;
+    int kind = 0;
+    uint32_t id = 0;
+    int i;
+    for (i = 0; i < (int)sizeof item; i++) ((char *)&item)[i] = 0;
+    item.thunk_id = 65599u;
+    item.modeled = 1;
+    item.behavior = "synthetic-process";
+    item.name[0] = 'G'; item.name[1] = 'e'; item.name[2] = 't'; item.name[3] = 'L';
+    item.name[4] = 'a'; item.name[5] = 's'; item.name[6] = 't'; item.name[7] = 'E';
+    item.name[8] = 'r'; item.name[9] = 'r'; item.name[10] = 'o'; item.name[11] = 'r';
+    proc.process_id = 0;
+    proc.last_error = 0x55;
+    if (!ae_token_decode(token, &kind, &id) || kind != AE_TOKEN_CALL || id != 65599u) {
+        putbuf("bad\n", 4);
+        return;
+    }
+    if (ae_dispatch(&proc, &item, 1, id, 0, 0, &result) != 0) {
+        putbuf("bad\n", 4);
+        return;
+    }
+    hex64(result);
+    putbuf("\n", 1);
+}
+void _start(void) {
+    driver();
+    register unsigned long x0 __asm__("x0") = 0;
+    register unsigned long x8 __asm__("x8") = 93;
+    __asm__ volatile("svc #0" :: "r"(x0), "r"(x8));
+    __builtin_trap();
+}
+'''
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            (td / "run.c").write_text(src)
+            obj, elf = td / "run.o", td / "run.elf"
+            cc = subprocess.run(
+                ["clang", "--target=aarch64-linux-gnu", "-ffreestanding", "-fno-stack-protector",
+                 "-O2", "-I", str(HERE), "-c", str(td / "run.c"), "-o", str(obj)],
+                capture_output=True, text=True, check=False)
+            self.assertEqual(cc.returncode, 0, cc.stderr)
+            ld = subprocess.run(["ld.lld", "-m", "aarch64linux", "-e", "_start", str(obj), "-o", str(elf)],
+                                capture_output=True, text=True, check=False)
+            self.assertEqual(ld.returncode, 0, ld.stderr)
+            run = subprocess.run([QEMU, str(elf)], capture_output=True, text=True, check=False)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(run.stdout.strip(), "0000000000000055")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

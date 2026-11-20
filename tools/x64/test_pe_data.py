@@ -26,6 +26,7 @@ class PeDataTests(unittest.TestCase):
             cli_built = subprocess.run(
                 ["clang", "-std=c11", "-Wall", "-Wextra", "-Werror", "-O2",
                  str(HERE / "pe_data_map.c"), str(HERE / "pe_data.c"), str(HERE / "guest_mem.c"),
+                 str(HERE / "ae_abi.c"), str(HERE / "ae_dispatch.c"), str(HERE / "ae_iat.c"),
                  "-I", str(HERE), "-o", str(cli)],
                 capture_output=True, text=True, check=False)
             self.assertEqual(cli_built.returncode, 0, cli_built.stderr)

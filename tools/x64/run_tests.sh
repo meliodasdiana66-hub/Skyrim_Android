@@ -11,6 +11,7 @@ python3 -B test_cfg_sandbox.py
 python3 -B test_guest_mem.py
 python3 -B test_pe_data.py
 python3 -B test_abi_registry.py
+python3 -B test_ae_iat.py
 if [ -f ../lift.py ] && [ -f ../../runtime/main.c ]; then
   python3 -B test_le_regression.py
   echo "LE regression: PASS"

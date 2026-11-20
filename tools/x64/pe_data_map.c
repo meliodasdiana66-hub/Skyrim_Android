@@ -1,6 +1,7 @@
 /* Read a PE32+ file in place and map it as data. Prints metadata only.
    Does not call the entry point, bind imports, or modify the file.
 */
+#include "ae_iat.h"
 #include "pe_data.h"
 
 #include <stdio.h>
@@ -95,6 +96,7 @@ int main(int argc, char **argv) {
     const char *base_text = NULL;
     uint64_t image_base = 0;
     int have_base = 0;
+    int bind_iat = 0;
     FILE *fp;
     long sz;
     uint8_t *file;
@@ -108,8 +110,10 @@ int main(int argc, char **argv) {
             expect = argv[++i];
         else if (strcmp(argv[i], "--image-base") == 0 && i + 1 < argc)
             base_text = argv[++i];
+        else if (strcmp(argv[i], "--bind-iat") == 0)
+            bind_iat = 1;
         else {
-            fprintf(stderr, "usage: pe_data_map --exe FILE [--expect-sha256 HEX] [--image-base 0xBASE]\n");
+            fprintf(stderr, "usage: pe_data_map --exe FILE [--expect-sha256 HEX] [--image-base 0xBASE] [--bind-iat]\n");
             return 2;
         }
     }
@@ -151,7 +155,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "sha256 mismatch\n");
         return 3;
     }
-    rc = pe_load_data(file, (size_t)sz, have_base ? &image_base : NULL, 1, &image);
+    rc = bind_iat ? pe_load_unsealed(file, (size_t)sz, have_base ? &image_base : NULL, 1, &image)
+                 : pe_load_data(file, (size_t)sz, have_base ? &image_base : NULL, 1, &image);
     free(file);
     if (rc == PE_ERR_NAME) {
         fprintf(stderr, "import name exceeds cap\n");
@@ -161,14 +166,58 @@ int main(int argc, char **argv) {
         fprintf(stderr, "pe data map failed\n");
         return 2;
     }
-    if (image->entry_called || image->imports_bound || guest_host_executable(image->mem)) {
+    if (image->entry_called || guest_host_executable(image->mem) ||
+        (!bind_iat && image->imports_bound)) {
         pe_image_destroy(image);
         fprintf(stderr, "refusing an executable mapping\n");
         return 2;
     }
+    if (bind_iat) {
+        AeRegistry *registry = NULL;
+        AeBindReport bound;
+        memset(&bound, 0, sizeof bound);
+        if (ae_registry_from_image(image, &registry) != AE_OK ||
+            ae_bind_iat(image, registry, &bound) != AE_OK) {
+            fprintf(stderr, "iat bind refused: %s\n", bound.reason != NULL ? bound.reason : "registry");
+            ae_registry_destroy(registry);
+            pe_image_destroy(image);
+            return 2;
+        }
+        guest_seal(image->mem);
+        if (image->entry_called || guest_host_executable(image->mem)) {
+            ae_registry_destroy(registry);
+            pe_image_destroy(image);
+            fprintf(stderr, "refusing an executable mapping\n");
+            return 2;
+        }
+        printf("{\n");
+        printf("  \"tool\": \"pe-data-map\",\n");
+        printf("  \"mapped\": true,\n");
+        printf("  \"bindRequested\": true,\n");
+        printf("  \"entryCalled\": false,\n");
+        printf("  \"importsBound\": true,\n");
+        printf("  \"hostExecutable\": false,\n");
+        printf("  \"imageBase\": %llu,\n", (unsigned long long)image->image_base);
+        printf("  \"sizeOfImage\": %u,\n", image->size_of_image);
+        printf("  \"addressOfEntryPoint\": %u,\n", image->entry_rva);
+        printf("  \"sectionCount\": %d,\n", image->section_count);
+        printf("  \"dllCount\": %d,\n", image->dll_count);
+        printf("  \"symbolCount\": %d,\n", image->symbol_count);
+        printf("  \"importCount\": %d,\n", image->import_count);
+        printf("  \"modeledBound\": %d,\n", bound.modeled);
+        printf("  \"trapBound\": %d,\n", bound.traps);
+        printf("  \"unresolvedImports\": %d,\n", bound.traps);
+        printf("  \"relocationsApplied\": %d,\n", image->relocations_applied);
+        printf("  \"note\": \"IAT slots hold guest thunk tokens. No host pointer was written and the entry point was not called.\"\n");
+        printf("}\n");
+        ae_registry_destroy(registry);
+        pe_image_destroy(image);
+        return 0;
+    }
     printf("{\n");
     printf("  \"tool\": \"pe-data-map\",\n");
     printf("  \"mapped\": true,\n");
+    printf("  \"bindRequested\": false,\n");
     printf("  \"entryCalled\": false,\n");
     printf("  \"importsBound\": false,\n");
     printf("  \"hostExecutable\": false,\n");

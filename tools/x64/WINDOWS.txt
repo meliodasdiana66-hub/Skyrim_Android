@@ -45,6 +45,10 @@ Alternate base. Relocation is staged before the pages become read-only, so read-
 
 Build it from this directory with the same clang used for the tests:
 
-  clang -std=c11 -O2 -Wall -Wextra -Werror pe_data_map.c pe_data.c guest_mem.c -o pe_data_map
+  clang -std=c11 -O2 -Wall -Wextra -Werror pe_data_map.c pe_data.c guest_mem.c ae_abi.c ae_dispatch.c ae_iat.c -o pe_data_map
+
+The command above leaves every import unresolved. --bind-iat is opt-in. It writes a guest token into each IAT slot before the image is sealed, then seals. A modeled import gets a call token. Every other import gets a trap token, not a success value. The entry point is still not called, the file is not modified, and no host pointer is stored. On this EXE that is 2 call tokens (GetLastError, GetCurrentProcessId) and 597 traps. SetLastError is not imported.
+
+  pe_data_map --exe "D:\Skyrim Anniversary Edition\SkyrimSE.exe" --expect-sha256 21A6F8244A57E880D02E600ADF61178AB5483DB7B3CCA8DBFC97D7CA1F081E18 --bind-iat
 
 Exit code 3 means the SHA-256 did not match and nothing was scanned.

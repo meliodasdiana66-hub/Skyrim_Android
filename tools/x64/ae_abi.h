@@ -17,7 +17,13 @@ enum {
     AE_OK = 0,
     AE_ERR_UNIMPLEMENTED = 1,
     AE_ERR_BAD_ID = 2,
-    AE_ERR_ARITY = 3
+    AE_ERR_ARITY = 3,
+    AE_ERR_TRAP = 4,
+    AE_ERR_ILLEGAL = 5,
+    AE_ERR_ALIGN = 6,
+    AE_ERR_BUDGET = 7,
+    AE_ERR_DEPTH = 8,
+    AE_ERR_BIND = 9
 };
 
 typedef struct AeProcess {

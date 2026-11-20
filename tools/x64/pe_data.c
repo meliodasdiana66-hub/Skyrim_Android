@@ -74,8 +74,8 @@ void pe_image_destroy(PeImage *image) {
     free(image);
 }
 
-int pe_load_data(const uint8_t *file, size_t file_len, const uint64_t *new_base,
-                 int host_read_only, PeImage **out) {
+static int load_data(const uint8_t *file, size_t file_len, const uint64_t *new_base,
+                     int host_read_only, int do_seal, PeImage **out) {
     uint32_t e_lfanew, opt, size_of_image, entry, nrva, nsec, optsize;
     uint64_t preferred;
     int i;
@@ -344,11 +344,22 @@ int pe_load_data(const uint8_t *file, size_t file_len, const uint64_t *new_base,
             image->import_count = symbols;
         }
     }
-    guest_seal(image->mem);
+    if (do_seal)
+        guest_seal(image->mem);
     if (guest_host_executable(image->mem) != 0) {
         pe_image_destroy(image);
         return PE_ERR_RANGE;
     }
     *out = image;
     return PE_OK;
+}
+
+int pe_load_data(const uint8_t *file, size_t file_len, const uint64_t *new_base,
+                 int host_read_only, PeImage **out) {
+    return load_data(file, file_len, new_base, host_read_only, 1, out);
+}
+
+int pe_load_unsealed(const uint8_t *file, size_t file_len, const uint64_t *new_base,
+                     int host_read_only, PeImage **out) {
+    return load_data(file, file_len, new_base, host_read_only, 0, out);
 }

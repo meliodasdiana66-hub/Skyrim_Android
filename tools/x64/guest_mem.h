@@ -50,7 +50,11 @@ uint64_t guest_span_visit_count(void);
    permissions. Refused after guest_seal. A failure restores every qword
    this call changed. */
 int guest_loader_reloc(GuestMem *mem, const uint8_t *reloc, size_t reloc_len, uint64_t delta);
+/* Loader-only store. Does not change span permissions and does not make a
+   host page executable. Refused after guest_seal. */
+int guest_loader_store(GuestMem *mem, uint64_t addr, const void *src, size_t n);
 void guest_seal(GuestMem *mem);
+int guest_is_sealed(const GuestMem *mem);
 int guest_map(GuestMem *mem, uint64_t addr, size_t size, int perms,
               const uint8_t *file_bytes, size_t file_len);
 int guest_read(GuestMem *mem, uint64_t addr, void *dst, size_t n);

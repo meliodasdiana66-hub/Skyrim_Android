@@ -44,6 +44,10 @@ void guest_seal(GuestMem *mem) {
         mem->sealed = 1;
 }
 
+int guest_is_sealed(const GuestMem *mem) {
+    return mem != NULL && mem->sealed;
+}
+
 static uint64_t page_base(uint64_t addr) {
     return addr & ~((uint64_t)GUEST_PAGE_SIZE - 1);
 }
@@ -399,6 +403,23 @@ int guest_apply_dir64(GuestMem *mem, const uint8_t *reloc, size_t reloc_len, uin
     if (cursor != reloc_len)
         return GUEST_ERR_RELOC;
     return commit_dir64(mem, reloc, reloc_len, delta, 1);
+}
+
+int guest_loader_store(GuestMem *mem, uint64_t addr, const void *src, size_t n) {
+    const uint8_t *bytes = src;
+    size_t i;
+    if (mem == NULL || mem->sealed || src == NULL || n == 0 || addr + n < addr)
+        return GUEST_ERR_PERM;
+    for (i = 0; i < n; i++) {
+        Page *page = find_page(mem, addr + i);
+        if (page == NULL || span_at(page, addr + i) == NULL)
+            return GUEST_ERR_UNMAPPED;
+    }
+    for (i = 0; i < n; i++) {
+        Page *page = find_page(mem, addr + i);
+        page->data[(size_t)((addr + i) - page->base)] = bytes[i];
+    }
+    return GUEST_OK;
 }
 
 int guest_loader_reloc(GuestMem *mem, const uint8_t *reloc, size_t reloc_len, uint64_t delta) {

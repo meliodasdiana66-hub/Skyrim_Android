@@ -62,6 +62,10 @@ typedef struct PeImage {
    and no guest pages remain. */
 int pe_load_data(const uint8_t *file, size_t file_len, const uint64_t *new_base,
                  int host_read_only, PeImage **out);
+/* Same map, but the image is left unsealed so the loader can initialize a
+   read-only IAT. Does not bind imports and does not call the entry point. */
+int pe_load_unsealed(const uint8_t *file, size_t file_len, const uint64_t *new_base,
+                     int host_read_only, PeImage **out);
 void pe_image_destroy(PeImage *image);
 
 #endif
