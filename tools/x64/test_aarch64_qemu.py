@@ -5,6 +5,7 @@ This is not a physical Android device, not Adreno, and not the game.
 If qemu-aarch64-static is absent the test skips and says that skip is not a pass.
 """
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+import cfg_sandbox  # noqa: E402
 import lift64  # noqa: E402
 
 QEMU = shutil.which("qemu-aarch64-static")
@@ -185,6 +187,64 @@ void _start(void) {
                 run = subprocess.run([QEMU, str(elf)], capture_output=True, text=True, check=False)
                 self.assertEqual(run.returncode, 0, run.stderr)
                 self.assertEqual(run.stdout, "11000\n")
+
+    def test_preserved_call_under_qemu_user_mode(self):
+            entry = 0x4000
+            helper = 0x4100
+            caller = bytes.fromhex("5389c3") + b"\xe8" + struct.pack("<i", helper - (entry + 8)) + bytes.fromhex("5bc3")
+            funcs = {entry: caller, helper: bytes.fromhex("89d8c3")}
+            source, _prepared = cfg_sandbox.emit_program(funcs, entry, freestanding=True)
+            driver = r'''
+    static void putbuf(const char *s, unsigned long n) {
+        register unsigned long x0 __asm__("x0") = 1;
+        register unsigned long x1 __asm__("x1") = (unsigned long)s;
+        register unsigned long x2 __asm__("x2") = n;
+        register unsigned long x8 __asm__("x8") = 64;
+        __asm__ volatile("svc #0" :: "r"(x0), "r"(x1), "r"(x2), "r"(x8) : "memory");
+    }
+    static void hex64(unsigned long v) {
+        char b[16];
+        int i;
+        for (i = 15; i >= 0; i--) { b[i] = "0123456789abcdef"[v & 15]; v >>= 4; }
+        putbuf(b, 16);
+    }
+    static void driver(void) {
+        static unsigned char mem[MEMSZ];
+        Cpu64 c;
+        int i;
+        for (i = 0; i < 16; i++) c.r[i] = 0;
+        c.r[0] = 0x22ull;
+        c.r[3] = 0x1111111111111111ull;
+        c.r[4] = 0xE008ull;
+        guest_4000(&c, mem);
+        hex64(c.r[0]);
+        putbuf(" ", 1);
+        hex64(c.r[3]);
+        putbuf("\n", 1);
+    }
+    void _start(void) {
+        driver();
+        register unsigned long x0 __asm__("x0") = 0;
+        register unsigned long x8 __asm__("x8") = 93;
+        __asm__ volatile("svc #0" :: "r"(x0), "r"(x8));
+        __builtin_trap();
+    }
+    '''
+            with tempfile.TemporaryDirectory() as td:
+                td = Path(td)
+                (td / "run.c").write_text(source + driver)
+                obj, elf = td / "run.o", td / "run.elf"
+                cc = subprocess.run(
+                    ["clang", "--target=aarch64-linux-gnu", "-nostdinc", "-ffreestanding",
+                     "-fno-stack-protector", "-O2", "-I", str(HERE), "-c", str(td / "run.c"), "-o", str(obj)],
+                    capture_output=True, text=True, check=False)
+                self.assertEqual(cc.returncode, 0, cc.stderr)
+                ld = subprocess.run(["ld.lld", "-m", "aarch64linux", "-e", "_start", str(obj), "-o", str(elf)],
+                                    capture_output=True, text=True, check=False)
+                self.assertEqual(ld.returncode, 0, ld.stderr)
+                run = subprocess.run([QEMU, str(elf)], capture_output=True, text=True, check=False)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(run.stdout.strip(), "0000000000000022 1111111111111111")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Synthetic direct calls and forward branches. Not a game scan."""
+import json
 import struct
 import sys
 import unittest
@@ -194,6 +195,109 @@ class CfgSandboxTests(unittest.TestCase):
             loaded = json.loads(out.read_text())
             self.assertFalse(loaded["executed"])
             self.assertNotIn(bytes(fixed).hex(), json.dumps(loaded))
+        dispositions = report["dispositions"]
+        self.assertEqual(sum(dispositions.values()), report["pdataEntries"])
+        self.assertEqual(dispositions.get("closed_graph_root"), 1)
+        self.assertEqual(dispositions.get("closed_graph_member"), 1)
+        self.assertEqual(dispositions.get("call_free"), 1)
+        self.assertEqual(report["closedGraphsFound"], 1)
+        self.assertEqual(report["closedGraphs"][0]["sizes"], [len(fixed), len(helper)])
+        self.assertNotIn("code", report["closedGraphs"][0])
+
+    def test_global_bytes_are_not_invented(self):
+        load = bytes.fromhex("8b0500000000") + b"\xe8" + struct.pack("<i", HELPER - (ENTRY + 11)) + b"\xc3"
+        helper = bytes.fromhex("83c001c3")
+        funcs = {ENTRY: load, HELPER: helper}
+        target = ENTRY + 6
+        self.assertEqual(cfg_sandbox.assess_graph(funcs, ENTRY), "precondition_required")
+        self.assertEqual(
+            cfg_sandbox.assess_graph(funcs, ENTRY, rip_regions=[(target, b"\x11\x22\x33\x44", True)]),
+            "precondition_required",
+        )
+        self.assertIsNone(
+            cfg_sandbox.assess_graph(funcs, ENTRY, rip_regions=[(target, b"\x11\x22\x33\x44", False)])
+        )
+
+    def test_carry_emitter_does_not_set_unread_depth(self):
+        code = bytes.fromhex("83e801") + bytes.fromhex("7207") + bytes.fromhex("bb00000000")
+        code += bytes.fromhex("eb05") + bytes.fromhex("bb01000000") + b"\xc3"
+        source, _prepared = cfg_sandbox.emit_program({ENTRY: code}, ENTRY)
+        self.assertNotRegex(source, r"\bdepth\b")
+        called, _prepared = cfg_sandbox.emit_program(_program(), ENTRY)
+        self.assertIn("++depth", called)
+        self.assertIn("depth--", called)
+
+    def test_execute_closed_graph_preserves_abi_and_rejects_unsafe(self):
+        # push rbx; mov ebx, eax; call helper; pop rbx; ret / mov eax, ebx; ret
+        caller = bytes.fromhex("5389c3") + b"\xe8" + struct.pack("<i", 0x1100 - (0x1003 + 5)) + bytes.fromhex("5bc3")
+        helper = bytes.fromhex("89d8c3")
+        image = _image_with({
+            0x1000: caller,
+            0x1100: helper,
+            0x1200: bytes.fromhex("8b01") + b"\xe8" + struct.pack("<i", 0x1100 - (0x1202 + 5)) + b"\xc3",
+            0x1300: bytes.fromhex("bb01000000") + b"\xe8" + struct.pack("<i", 0x1100 - (0x1305 + 5)) + b"\xc3",
+            0x1400: bytes.fromhex("488b4424f8") + b"\xe8" + struct.pack("<i", 0x1100 - (0x1405 + 5)) + b"\xc3",
+        })
+        report = cfg_sandbox.execute_image(bytes(image), max_graphs=8, max_functions=4, max_instructions=32, max_cases=2)
+        self.assertEqual(sum(report["dispositions"].values()), report["pdataEntries"])
+        self.assertEqual(report["closedGraphsFound"], 4)
+        self.assertEqual(report["graphsExecuted"], 1)
+        self.assertEqual(report["casesMatched"], 2)
+        self.assertEqual(report["casesExecuted"], 2)
+        executed = [row for row in report["verifiedGraphs"] if row["status"] == "verified_match"]
+        self.assertEqual(len(executed), 1)
+        self.assertEqual(executed[0]["entry"], 0x1000)
+        self.assertTrue(executed[0]["instructions"])
+        self.assertNotIn(0x1200, executed[0]["instructions"])
+        rejected = {row["entry"]: row["reason"] for row in report["rejections"]}
+        self.assertEqual(rejected[0x1200], "sandbox_untracked")
+        self.assertEqual(rejected[0x1300], "abi_unpreserved")
+        self.assertEqual(rejected[0x1400], "stack_external")
+        blob = json.dumps(report)
+        self.assertNotIn(caller.hex(), blob)
+        self.assertNotIn(helper.hex(), blob)
+        limited = cfg_sandbox.execute_image(bytes(image), max_graphs=1, max_functions=1, max_instructions=32, max_cases=1)
+        self.assertEqual(limited["graphsExecuted"], 0)
+        self.assertTrue(any(row["reason"] == "too_many_functions" for row in limited["rejections"]))
+
+
+def _image_with(bodies):
+    image = bytearray(0x1600)
+    image[0:2] = b"MZ"
+    image[0x3C:0x40] = struct.pack("<I", 0x80)
+    image[0x80:0x84] = b"PE\0\0"
+    fh = 0x84
+    image[fh:fh + 2] = struct.pack("<H", 0x8664)
+    image[fh + 2:fh + 4] = struct.pack("<H", 4)
+    image[fh + 16:fh + 18] = struct.pack("<H", 0xF0)
+    image[fh + 18:fh + 20] = struct.pack("<H", 0x22)
+    opt = fh + 20
+    image[opt:opt + 2] = struct.pack("<H", 0x20B)
+    image[opt + 16:opt + 20] = struct.pack("<I", 0x5000)
+    image[opt + 24:opt + 32] = struct.pack("<Q", 0x140000000)
+    image[opt + 56:opt + 60] = struct.pack("<I", 0x600)
+    image[opt + 108:opt + 112] = struct.pack("<I", 16)
+    ranges = sorted(bodies)
+    image[opt + 112 + 24:opt + 112 + 32] = struct.pack("<II", 0x3000, len(ranges) * 12)
+
+    def section(index, name, va, raw_ptr, raw_size, chars):
+        off = opt + 0xF0 + index * 40
+        image[off:off + 8] = name.encode().ljust(8, b"\0")
+        image[off + 8:off + 12] = struct.pack("<I", 0x800 if name == ".text" else 0x200)
+        image[off + 12:off + 16] = struct.pack("<I", va)
+        image[off + 16:off + 20] = struct.pack("<I", raw_size)
+        image[off + 20:off + 24] = struct.pack("<I", raw_ptr)
+        image[off + 36:off + 40] = struct.pack("<I", chars)
+
+    section(0, ".text", 0x1000, 0x400, 0x800, 0x60000020)
+    section(1, ".rdata", 0x2000, 0xC00, 0x200, 0x40000040)
+    section(2, ".pdata", 0x3000, 0xE00, 0x200, 0x40000040)
+    section(3, ".bind", 0x4000, 0x1000, 0x200, 0x60000000)
+    for rva, code in bodies.items():
+        image[0x400 + (rva - 0x1000):0x400 + (rva - 0x1000) + len(code)] = code
+    for n, rva in enumerate(ranges):
+        image[0xE00 + n * 12:0xE00 + n * 12 + 8] = struct.pack("<II", rva, rva + len(bodies[rva]))
+    return image
 
 
 if __name__ == "__main__":

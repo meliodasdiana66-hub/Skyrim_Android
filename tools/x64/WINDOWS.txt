@@ -23,8 +23,12 @@ py -3 pe32plus_load.py --exe "D:\Skyrim Anniversary Edition\SkyrimSE.exe" --expe
 
 --logical-map prints RVA intervals, permissions, zero-fill and gaps. It does not allocate 59 MiB, does not copy section bytes, and does not call the entry point.
 
-Closed direct-call discovery. This does not execute any graph and does not treat a .pdata entry as safe. It is not a game run. The JSON has no instruction bytes.
+Closed direct-call discovery. This does not execute any graph and does not treat a .pdata entry as safe. dispositions covers every pdata entry once. closedGraphsFound counts graph roots only. A callee is closed_graph_member, and a decoded body with no call is call_free. Neither is an extra graph. It is not a game run. The JSON has no instruction bytes.
 
   py -3 cfg_sandbox.py --exe "D:\Skyrim Anniversary Edition\SkyrimSE.exe" --expect-sha256 21A6F8244A57E880D02E600ADF61178AB5483DB7B3CCA8DBFC97D7CA1F081E18 --max-graphs 8 --report "%USERPROFILE%\skyrimse-closed-graphs.json"
+
+Execute only the closed graphs that pass the stack, callee-saved register, and memory contract. --max-graphs, --max-functions, --max-instructions, and --max-cases are the budgets. The PE entry point is not called. A graph that reads an untracked address or a writable global is rejected and not run; those bytes are not invented. verifiedGraphs instructions are RVAs, not bytes. A mismatch stays in the JSON. This is Windows x64 versus Unicorn, not ARM64 and not a game launch.
+
+  py -3 cfg_sandbox.py --exe "D:\Skyrim Anniversary Edition\SkyrimSE.exe" --expect-sha256 21A6F8244A57E880D02E600ADF61178AB5483DB7B3CCA8DBFC97D7CA1F081E18 --execute --max-graphs 1 --max-functions 8 --max-instructions 64 --max-cases 4 --report "%USERPROFILE%\skyrimse-closed-execute.json"
 
 Exit code 3 means the SHA-256 did not match and nothing was scanned.
