@@ -322,15 +322,17 @@ class DiagnosticDetailTests(unittest.TestCase):
         struct.pack_into("<III", blob, 0xB0C, 0x1100, 0x1102, 0)
         struct.pack_into("<III", blob, 0xB18, 0x1200, 0x1200 + len(second), 0)
         found = cfg_sandbox.discover_modeled_iat(bytes(blob))
-        self.assertEqual(found["eligible"], 0)
+        self.assertEqual(found["eligibleEntries"], [0x1000])
         self.assertFalse(found["executed"])
         by_rva = {row["rva"]: row for row in found["modeledCandidates"]}
         self.assertEqual(sorted(by_rva), [0x1000, 0x1200])
-        self.assertIn("direct_call", by_rva[0x1000]["reasons"])
+        self.assertEqual(by_rva[0x1000]["reasons"], [])
+        self.assertTrue(by_rva[0x1000]["closure"]["proven"])
         self.assertEqual(by_rva[0x1000]["directCallTargets"], [0x1100])
         self.assertEqual(by_rva[0x1000]["imports"][0]["name"], "GetLastError")
         self.assertTrue(by_rva[0x1000]["imports"][0]["modeled"])
-        self.assertEqual(by_rva[0x1200]["reasons"], ["memory_or_global"])
+        self.assertEqual(by_rva[0x1200]["reasons"], ["memory_access"])
+        self.assertEqual(by_rva[0x1200]["memory"][0]["kind"], "rip")
         access = by_rva[0x1200]["memory"][0]
         self.assertEqual(access["kind"], "rip")
         self.assertEqual(access["access"], "load")
@@ -341,6 +343,63 @@ class DiagnosticDetailTests(unittest.TestCase):
         text = json.dumps(found)
         self.assertNotIn("4883ec28", text)
         self.assertNotIn("8b05", text.lower())
+
+
+class TailTransferTests(unittest.TestCase):
+    def test_tail_jump_is_not_a_load_and_verifies_when_proven(self):
+        iat = 0x2100
+        callee = 0x1100
+        code = bytes.fromhex("31c04883ec28")
+        code += b"\xff\x15" + struct.pack("<i", iat - (0x1000 + len(code) + 6))
+        code += bytes.fromhex("4883c428")
+        code += b"\xe9" + struct.pack("<i", callee - (0x1000 + len(code) + 5))
+        helper = b"\xc3"
+        blob = bytearray(0x800)
+        blob[0:2] = b"MZ"
+        struct.pack_into("<I", blob, 0x3C, 0x80)
+        blob[0x80:0x84] = b"PE\0\0"
+        struct.pack_into("<HH", blob, 0x84, 0x8664, 3)
+        struct.pack_into("<H", blob, 0x94, 0xF0)
+        struct.pack_into("<H", blob, 0x98, 0x20B)
+        struct.pack_into("<I", blob, 0x98 + 16, 0x1F00)
+        struct.pack_into("<Q", blob, 0x98 + 24, 0x140000000)
+        struct.pack_into("<I", blob, 0x98 + 56, 0x3000)
+        struct.pack_into("<I", blob, 0x98 + 108, 16)
+        struct.pack_into("<II", blob, 0x98 + 120, 0x2000, 40)
+        struct.pack_into("<II", blob, 0x98 + 136, 0x1800, 24)
+        blob[0x188:0x18D] = b".text"
+        struct.pack_into("<IIIIII", blob, 0x188 + 8, 0x200, 0x1000, 0x200, 0x400, 0, 0)
+        struct.pack_into("<I", blob, 0x188 + 36, 0x60000020)
+        blob[0x1B0:0x1B5] = b".data"
+        struct.pack_into("<IIIIII", blob, 0x1B0 + 8, 0x200, 0x2000, 0x200, 0x600, 0, 0)
+        struct.pack_into("<I", blob, 0x1B0 + 36, 0xC0000040)
+        blob[0x1D8:0x1DE] = b".pdata"
+        struct.pack_into("<IIIIII", blob, 0x1D8 + 8, 0x100, 0x1800, 0x100, 0x300, 0, 0)
+        struct.pack_into("<I", blob, 0x1D8 + 36, 0x40000040)
+        blob[0x400:0x400 + len(code)] = code
+        blob[0x500:0x501] = helper
+        struct.pack_into("<IIIII", blob, 0x600, 0x2040, 0, 0, 0x2080, 0x2100)
+        struct.pack_into("<Q", blob, 0x640, 0x2120)
+        blob[0x680:0x68D] = b"KERNEL32.dll"
+        blob[0x722:0x72F] = b"GetLastError"
+        struct.pack_into("<III", blob, 0x300, 0x1000, 0x1000 + len(code), 0)
+        struct.pack_into("<III", blob, 0x30C, 0x1100, 0x1101, 0)
+        found = cfg_sandbox.discover_modeled_iat(bytes(blob))
+        row = found["modeledCandidates"][0]
+        self.assertEqual(row["reasons"], [])
+        self.assertTrue(row["closure"]["proven"])
+        self.assertEqual(row["closure"]["nodes"][0]["targets"][-1]["mnemonic"], "jmp")
+        self.assertEqual(row["closure"]["nodes"][0]["targets"][-1]["target"], 0x1100)
+        self.assertEqual(row["memory"], [])
+        self.assertIn("xor", row["alu"])
+        self.assertEqual(found["eligibleEntries"], [0x1000])
+        self.assertNotIn("memory_access", found["reasonMembership"])
+        verified = cfg_sandbox.verify_modeled_iat(bytes(blob), last_seed=0x55)
+        self.assertTrue(verified["verifyExecuted"])
+        self.assertFalse(verified["entryPointExecuted"])
+        self.assertEqual(verified["verified"][0]["rax"], 0x55)
+        self.assertEqual(verified["verified"][0]["rbx"], 0xA11CE)
+        self.assertEqual(verified["verified"][0]["oracle"], "unicorn-canonical-stub")
 
 
 class HighIatDiscoveryTests(unittest.TestCase):

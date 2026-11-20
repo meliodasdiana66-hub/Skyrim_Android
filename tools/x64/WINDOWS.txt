@@ -55,7 +55,7 @@ Read-only search for small routines whose only calls are KERNEL32 GetLastError o
 
   py -3 cfg_sandbox.py --exe "D:\Skyrim Anniversary Edition\SkyrimSE.exe" --expect-sha256 21A6F8244A57E880D02E600ADF61178AB5483DB7B3CCA8DBFC97D7CA1F081E18 --iat-discover --report "%USERPROFILE%\skyrimse-iat-discover.json"
 
-The discover report now includes every reason on a routine, not only the primary one, and modeledCandidates for every routine that calls GetLastError or GetCurrentProcessId. Each candidate lists import names, direct-call RVAs, and access metadata. It does not list instruction bytes. Do not run --iat-verify until that report shows a candidate with an empty reason list.
+The discover report keeps every reason. A jmp or jcc is a control transfer with a target RVA, not a memory access. xor and test are ALU. memory_access is only a real load or store. Each modeled candidate includes a read-only closure: jump and call targets, pdata ownership, image bounds, cycles, and whether a tail jump has a proven return. A tail jump is not rewritten into a ret. Do not run --iat-verify unless eligibleEntries is non-empty.
 
 --iat-verify is separate. It runs only routines that discover called eligible, with a virtual last_error seed. Unicorn's reference uses a canonical stub and a rewritten IAT cell in that reference image. The lifted path still checks the non-canonical token. It is not a Windows API and it does not call the entry point.
 

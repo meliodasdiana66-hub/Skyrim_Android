@@ -100,7 +100,7 @@ def token_decode(token):
     return kind, thunk_id
 
 
-def _decode(code, base, allow_iat=False):
+def _decode(code, base, allow_iat=False, allow_tail=False):
     if len(code) > MAX_INSNS * 8:
         raise CfgError("step_budget")
     try:
@@ -109,16 +109,20 @@ def _decode(code, base, allow_iat=False):
         raise CfgError(exc.reason) from exc
     if len(insns) > MAX_INSNS:
         raise CfgError("step_budget")
-    if not insns or insns[-1]["mnemonic"] != "ret":
+    if not insns:
+        raise CfgError("missing_ret")
+    last = insns[-1]["mnemonic"]
+    tail = allow_tail and last == "jmp" and "target" in insns[-1]
+    if last != "ret" and not tail:
         raise CfgError("missing_ret")
     if not allow_iat and any(insn["mnemonic"] == "call_rip" for insn in insns):
         raise CfgError("indirect_call")
     return insns
 
 
-def _edges(insns, base, size):
+def _edges(insns, base, size, allow_tail=False, funcs=None):
     calls = []
-    for insn in insns:
+    for index, insn in enumerate(insns):
         name = insn["mnemonic"]
         if name == "call":
             calls.append(insn["target"])
@@ -126,7 +130,12 @@ def _edges(insns, base, size):
             target = insn["target"]
             if target <= insn["address"]:
                 raise CfgError("back_edge")
-            if not (base <= target < base + size):
+            inside = base <= target < base + size
+            tail = (allow_tail and name == "jmp" and index == len(insns) - 1
+                    and funcs is not None and target in funcs)
+            if tail:
+                calls.append(target)
+            elif not inside:
                 raise CfgError("cross_function_branch")
     return calls
 
@@ -158,7 +167,7 @@ def _check_iat_addr(addr, slots, limit):
 
 
 def prepare(funcs, entry, imports=None, max_steps=MAX_STEPS_DEFAULT, iat_slots=None,
-            image_limit=None):
+            image_limit=None, allow_tail=False):
     """Validate an explicit function map. Does not execute it."""
     if not funcs or entry not in funcs:
         raise CfgError("unknown_target")
@@ -169,11 +178,11 @@ def prepare(funcs, entry, imports=None, max_steps=MAX_STEPS_DEFAULT, iat_slots=N
     graph = {}
     logical = 0
     for base, code in funcs.items():
-        insns = _decode(code, base, allow_iat=iat_slots is not None)
+        insns = _decode(code, base, allow_iat=iat_slots is not None, allow_tail=allow_tail)
         for insn in insns:
             if insn["mnemonic"] == "call_rip":
                 _check_iat_addr(insn["iat"], iat_slots, MEMSZ if image_limit is None else image_limit)
-        calls = _edges(insns, base, len(code))
+        calls = _edges(insns, base, len(code), allow_tail=allow_tail, funcs=funcs)
         for target in calls:
             if target in imports:
                 raise CfgError("unbound_import:" + imports[target])
@@ -267,7 +276,11 @@ def _emit_function(base, code, insns, max_steps, max_depth, iat_slots=None, last
             lines.append("            wr(c, 4, rd(c, 4, 64) + 8, 64);")
             lines.append("            return;")
         elif term["mnemonic"] == "jmp":
-            lines.append("            block = %d; continue;" % ids[term["target"]])
+            if term["target"] in ids:
+                lines.append("            block = %d; continue;" % ids[term["target"]])
+            else:
+                lines.append("            %s(c, mem);" % _c_name(term["target"]))
+                lines.append("            return;")
         elif term["mnemonic"] in JCC:
             fall = term["address"] + term["size"]
             lines.append("            if (%s) { block = %d; continue; }" % (JCC[term["mnemonic"]], ids[term["target"]]))
@@ -350,9 +363,9 @@ static int ae_iat_call(Cpu64 *c, uint8_t *mem, uint64_t slot, unsigned expect_id
 
 def emit_program(funcs, entry, imports=None, max_steps=MAX_STEPS_DEFAULT, max_depth=MAX_DEPTH_DEFAULT,
                   freestanding=False, iat_slots=None, last_addr=0, pid=0, report_stop=False,
-                  image_limit=None, external=None):
+                  image_limit=None, external=None, allow_tail=False):
     prepared = prepare(funcs, entry, imports=imports, max_steps=max_steps, iat_slots=iat_slots,
-                       image_limit=image_limit)
+                       image_limit=image_limit, allow_tail=allow_tail)
     uses_depth = any(
         insn["mnemonic"] in ("call", "call_rip")
         for base in prepared["reachable"]
@@ -540,7 +553,7 @@ def _production_token(slot):
 
 def execute_iat(funcs, entry, cpu, mem, return_ip, iat_slots, last_addr, pid,
                 max_steps=MAX_STEPS_DEFAULT, max_depth=MAX_DEPTH_DEFAULT, probe=None,
-                image_limit=None):
+                image_limit=None, allow_tail=False):
     """Lift call [rip+disp32] through a registered guest token.
 
     The lifter reads the production token and never fetches it. Unicorn gets
@@ -582,7 +595,8 @@ def execute_iat(funcs, entry, cpu, mem, return_ip, iat_slots, last_addr, pid,
         external[addr] = _production_token(slot)
     source, prepared = emit_program(
         funcs, entry, iat_slots=iat_slots, max_steps=max_steps, max_depth=max_depth,
-        last_addr=last_addr, pid=pid, report_stop=True, image_limit=limit, external=external)
+        last_addr=last_addr, pid=pid, report_stop=True, image_limit=limit, external=external,
+        allow_tail=allow_tail)
     td = Path(tempfile.mkdtemp(prefix="x64iat-"))
     src = td / "cfg.c"
     exe = td / "cfg"
@@ -1607,6 +1621,136 @@ def _memory_meta(insn, sections, image_size):
     }
 
 
+_STRAIGHT = frozenset({"nop", "mov", "movzx", "add", "sub", "cmp", "and", "or", "xor", "test"})
+
+
+def _rsp_delta(insns):
+    """Net RSP change of a straight body. None if a write to RSP is not an immediate."""
+    delta = 0
+    for insn in insns:
+        writes = [index for index, _bits in insn.get("writes", [])]
+        name = insn["mnemonic"]
+        if 4 in writes and name in ("add", "sub") and "imm" in insn and not insn.get("mem"):
+            delta += insn["imm"] if name == "add" else -insn["imm"]
+        elif 4 in writes:
+            return None
+        elif name == "push":
+            delta -= insn.get("stack", ("push", 8))[1]
+        elif name == "pop":
+            delta += insn.get("stack", ("pop", 8))[1]
+    return delta
+
+
+def _load_body(data, info, begin, end):
+    try:
+        off = inspect_pe32plus.file_offset_for_rva(info["sections"], begin, end - begin)
+    except inspect_pe32plus.PeFormatError:
+        return None
+    code = bytes(data[off:off + (end - begin)])
+    try:
+        return decode_allow.decode_stream(code, begin, control=True)
+    except decode_allow.Reject:
+        return None
+
+
+def _modeled_closure(data, info, pdata, root, slots, image_size):
+    """Read-only walk of direct calls and tail jumps. Does not execute."""
+    nodes = []
+    color = {}
+
+    def walk(cur, depth):
+        if color.get(cur) == 1:
+            return "cycle"
+        if color.get(cur) == 2:
+            return None
+        if depth > 8 or len(nodes) >= 8:
+            return "budget"
+        end = pdata.get(cur)
+        sec = _section_at(info["sections"], cur)
+        node = {
+            "rva": cur,
+            "end": end,
+            "pdata": end is not None,
+            "section": None if sec is None else sec["name"],
+            "executable": None if sec is None else bool(sec["executable"]),
+            "inImage": isinstance(cur, int) and 0 <= cur < image_size,
+            "targets": [],
+            "unresolved": [],
+        }
+        nodes.append(node)
+        if end is None or sec is None or not sec["executable"]:
+            node["unresolved"].append("target_not_in_pdata")
+            return "target_not_in_pdata"
+        insns = _load_body(data, info, cur, end)
+        if insns is None:
+            node["unresolved"].append("undecodable")
+            return "undecodable"
+        color[cur] = 1
+        delta = _rsp_delta(insns)
+        last = insns[-1]
+        node["terminator"] = last["mnemonic"]
+        node["rspDelta"] = delta
+        blocker = None
+        for insn in insns:
+            name = insn["mnemonic"]
+            if name in JCC or name == "jmp":
+                target = insn["target"]
+                intra = cur <= target < end
+                node["targets"].append({
+                    "mnemonic": name, "at": insn["address"], "target": target, "intra": intra,
+                    "pdata": _pdata_owner(pdata, target),
+                })
+                if target <= insn["address"]:
+                    blocker = "back_edge"
+                elif not intra and not (name == "jmp" and insn is last):
+                    blocker = "unproven_branch"
+                elif name == "jmp" and insn is last:
+                    if delta != 0:
+                        blocker = "unbalanced_tail"
+                    else:
+                        found = walk(target, depth + 1)
+                        if found:
+                            blocker = found
+            elif insn.get("mem") or insn.get("rip"):
+                blocker = "memory_access"
+            elif name == "call":
+                node["targets"].append({
+                    "mnemonic": "call", "at": insn["address"], "target": insn["target"],
+                    "intra": False, "pdata": _pdata_owner(pdata, insn["target"]),
+                })
+                found = walk(insn["target"], depth + 1)
+                if found:
+                    blocker = found
+            elif name == "call_rip":
+                slot = slots.get(insn["iat"])
+                if slot is None or slot["ordinal"] or not slot["modeled"]:
+                    blocker = "unresolved_import"
+            elif name not in _STRAIGHT and name not in ("push", "pop", "ret"):
+                blocker = "unsupported_instruction"
+        if last["mnemonic"] not in ("ret", "jmp"):
+            blocker = "missing_ret"
+        if blocker:
+            node["unresolved"].append(blocker)
+        color[cur] = 2
+        return blocker
+
+    blocker = walk(root, 0)
+    return {
+        "proven": blocker is None,
+        "cycle": blocker == "cycle",
+        "blocker": blocker,
+        "nodes": nodes,
+        "executed": False,
+    }
+
+
+def _pdata_owner(pdata, addr):
+    for begin, end in pdata.items():
+        if begin <= addr < end:
+            return begin
+    return None
+
+
 def discover_modeled_iat(data):
     """Count small routines whose only calls are modeled IAT slots. Executes nothing."""
     info = inspect_pe32plus.inspect_bytes(data)
@@ -1648,6 +1792,12 @@ def discover_modeled_iat(data):
         lo = sec["virtualAddress"]
         executable.append((lo, lo + max(sec["virtualSize"], 1)))
     obstacles = Counter()
+    pdata = {}
+    for n in range(len(blob) // 12):
+        begin = int.from_bytes(blob[n * 12:n * 12 + 4], "little")
+        end = int.from_bytes(blob[n * 12 + 4:n * 12 + 8], "little")
+        if end > begin and end - begin <= MAX_INSNS * 8:
+            pdata[begin] = end
     for n in range(len(blob) // 12):
         begin = int.from_bytes(blob[n * 12:n * 12 + 4], "little")
         end = int.from_bytes(blob[n * 12 + 4:n * 12 + 8], "little")
@@ -1669,16 +1819,19 @@ def discover_modeled_iat(data):
         report["withRipCall"] += 1
         rank = {
             "iat_oob": 0, "iat_misaligned": 1, "iat_cross_page": 2, "unknown_iat": 3,
-            "iat_ordinal": 4, "iat_unmodeled": 5, "direct_call": 6, "memory_or_global": 7,
-            "missing_ret": 8,
+            "iat_ordinal": 4, "iat_unmodeled": 5, "memory_access": 6, "unsupported_instruction": 7,
+            "back_edge": 8, "unproven_tail": 9, "direct_call": 10, "missing_ret": 11,
         }
         reasons = set()
         imports = []
         direct_targets = []
         memory = []
+        control = []
+        alu = []
         modeled_calls = 0
         for insn in insns:
-            if insn["mnemonic"] == "call_rip":
+            name = insn["mnemonic"]
+            if name == "call_rip":
                 report["callRip"] += 1
                 addr = insn["iat"]
                 fault = iat_slot_fault(addr, image_size)
@@ -1706,25 +1859,56 @@ def discover_modeled_iat(data):
                         else:
                             reasons.add("iat_unmodeled")
                     imports.append(row)
-            elif insn["mnemonic"] == "call":
+            elif name == "call":
                 reasons.add("direct_call")
                 direct_targets.append(insn["target"])
-            elif insn["mnemonic"] not in ("mov", "sub", "add", "ret") or insn.get("mem") or insn.get("rip"):
-                reasons.add("memory_or_global")
+            elif name in JCC or name == "jmp":
+                target = insn.get("target")
+                intra = target is not None and begin <= target < end
+                owner = None if target is None else _pdata_owner(pdata, target)
+                control.append({
+                    "mnemonic": name,
+                    "at": insn["address"],
+                    "target": target,
+                    "intra": intra,
+                    "pdata": owner,
+                    "backEdge": target is not None and target <= insn["address"],
+                })
+                if target is None:
+                    reasons.add("unsupported_instruction")
+                elif target <= insn["address"]:
+                    reasons.add("back_edge")
+                elif not intra and name != "jmp":
+                    reasons.add("unproven_tail")
+            elif insn.get("mem") or insn.get("rip"):
+                reasons.add("memory_access")
                 memory.append(_memory_meta(insn, info["sections"], image_size))
-            elif insn["mnemonic"] in ("sub", "add") and not any(index == 4 for index, _bits in insn["writes"]):
-                reasons.add("memory_or_global")
-                memory.append(_memory_meta(insn, info["sections"], image_size))
-        if not insns or insns[-1]["mnemonic"] != "ret":
+            elif name in _STRAIGHT:
+                alu.append(name)
+            elif name in ("push", "pop", "ret"):
+                pass
+            else:
+                reasons.add("unsupported_instruction")
+                control.append({"mnemonic": name, "at": insn["address"], "target": None})
+        last = insns[-1] if insns else None
+        if last is None or last["mnemonic"] not in ("ret", "jmp"):
             reasons.add("missing_ret")
+        elif last["mnemonic"] == "jmp":
+            reasons.add("unproven_tail")
+        closure = None
+        if modeled_calls:
+            closure = _modeled_closure(data, info, pdata, begin, slots, image_size)
+            if closure["proven"]:
+                reasons.discard("unproven_tail")
+                reasons.discard("direct_call")
         if not reasons:
             report["eligible"] += 1
             report["eligibleEntries"].append(begin)
         else:
-            primary = min(reasons, key=lambda name: rank[name])
+            primary = min(reasons, key=lambda item: rank[item])
             obstacles[primary] += 1
-            for name in reasons:
-                membership[name] += 1
+            for item in reasons:
+                membership[item] += 1
         if modeled_calls:
             report["modeledCandidates"].append({
                 "rva": begin,
@@ -1733,7 +1917,11 @@ def discover_modeled_iat(data):
                 "modeledCalls": modeled_calls,
                 "imports": imports,
                 "directCallTargets": direct_targets,
+                "control": control,
+                "alu": sorted(set(alu)),
                 "memory": memory,
+                "rspDelta": _rsp_delta(insns),
+                "closure": closure,
             })
     report["obstacles"] = dict(obstacles)
     report["reasonMembership"] = dict(membership)
@@ -1744,8 +1932,10 @@ def discover_modeled_iat(data):
         "KERNEL32 GetLastError or GetCurrentProcessId. obstacles is one primary "
         "reason per routine. reasonMembership counts every reason. "
         "modeledCandidates lists every routine that calls one of those two, with "
-        "import names, direct-call RVAs, and access metadata. Width is not an "
-        "object size. No instruction bytes are included."
+        "import names, direct-call RVAs, jump targets, and access metadata. "
+        "A jmp is control flow, not a data load. A tail transfer is proven only "
+        "when RSP is unchanged and the callee returns. Width is not an object "
+        "size. No instruction bytes are included."
     )
     return report
 
@@ -1765,21 +1955,34 @@ def verify_modeled_iat(data, last_seed=0x55, pid=0xABCD, max_entries=1):
     off = inspect_pe32plus.file_offset_for_rva(info["sections"], exc["virtualAddress"], exc["size"])
     blob = data[off:off + exc["size"]]
     wanted = set(report["eligibleEntries"][:max_entries])
+    by_rva = {row["rva"]: row for row in report["modeledCandidates"]}
     for n in range(len(blob) // 12):
         begin = int.from_bytes(blob[n * 12:n * 12 + 4], "little")
         end = int.from_bytes(blob[n * 12 + 4:n * 12 + 8], "little")
         if begin not in wanted:
             continue
-        raw_at = inspect_pe32plus.file_offset_for_rva(info["sections"], begin, end - begin)
-        code = bytes(data[raw_at:raw_at + (end - begin)])
-        insns = decode_allow.decode_stream(code, begin, control=True)
-        used = {}
-        for insn in insns:
-            if insn["mnemonic"] != "call_rip":
+        cand = by_rva.get(begin)
+        spans = cand["closure"]["nodes"] if cand and cand.get("closure") else [{"rva": begin, "end": end}]
+        funcs = {}
+        for node in spans:
+            if not node.get("end"):
                 continue
-            slot = dict(slots[insn["iat"]])
-            slot["token"] = guest_token(1, slot["id"])
-            used[insn["iat"]] = slot
+            raw_at = inspect_pe32plus.file_offset_for_rva(
+                info["sections"], node["rva"], node["end"] - node["rva"])
+            funcs[node["rva"]] = bytes(data[raw_at:raw_at + (node["end"] - node["rva"])])
+        used = {}
+        sequence = []
+        for node in spans:
+            body = funcs.get(node["rva"])
+            if body is None:
+                continue
+            for insn in decode_allow.decode_stream(body, node["rva"], control=True):
+                if insn["mnemonic"] != "call_rip":
+                    continue
+                slot = dict(slots[insn["iat"]])
+                slot["token"] = guest_token(1, slot["id"])
+                used[insn["iat"]] = slot
+                sequence.append(slot["name"])
         mem = bytearray(MEMSZ)
         mem[STACK_TOP:STACK_TOP + 8] = struct.pack("<Q", DONE)
         mem[0x2200:0x2204] = struct.pack("<I", last_seed & 0xFFFFFFFF)
@@ -1790,12 +1993,12 @@ def verify_modeled_iat(data, last_seed=0x55, pid=0xABCD, max_entries=1):
             if addr + 8 <= MEMSZ:
                 mem[addr:addr + 8] = struct.pack("<Q", slot["token"])
         result = execute_iat(
-            {begin: code}, begin, cpu, mem, DONE, used, 0x2200, pid,
-            image_limit=info["sizeOfImage"])
+            funcs, begin, cpu, mem, DONE, used, 0x2200, pid,
+            image_limit=info["sizeOfImage"],
+            allow_tail=any(node.get("terminator") == "jmp" for node in spans))
         rax, last = 0, last_seed & 0xFFFFFFFF
-        for insn in insns:
-            if insn["mnemonic"] == "call_rip":
-                rax, last = virtual_api(used[insn["iat"]]["name"], 0, last, pid, rax)
+        for name in sequence:
+            rax, last = virtual_api(name, 0, last, pid, rax)
         if rax is None or result["rax"] != rax or result["lastError"] != last:
             raise CfgError("virtual_api_mismatch")
         report["verified"].append({
