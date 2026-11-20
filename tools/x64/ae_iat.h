@@ -12,7 +12,9 @@
 
 enum { AE_TOKEN_CALL = 1, AE_TOKEN_TRAP = 2 };
 
-/* Above every RVA this loader can map (the image cap is 64 MiB). */
+/* Above every RVA this loader can map (the image cap is 64 MiB).
+   Bit 63 is also IMAGE_ORDINAL_FLAG64 on an unbound import thunk.
+   A token is accepted only when kind and id rebuild this exact value. */
 static inline uint64_t ae_guest_token(int kind, uint32_t thunk_id) {
     return 0x8000000000000000ULL | ((uint64_t)(kind & 0xF) << 36) |
            ((uint64_t)(thunk_id & 0x0FFFFFFFu) << 4);

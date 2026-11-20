@@ -51,4 +51,8 @@ The command above leaves every import unresolved. --bind-iat is opt-in. It write
 
   pe_data_map --exe "D:\Skyrim Anniversary Edition\SkyrimSE.exe" --expect-sha256 21A6F8244A57E880D02E600ADF61178AB5483DB7B3CCA8DBFC97D7CA1F081E18 --bind-iat
 
+Read-only search for small routines whose only calls are KERNEL32 GetLastError or GetCurrentProcessId. It does not execute a graph and does not call the entry point. eligible may be 0. That count is the result. The JSON has RVAs and counts, not instruction bytes. An unbound IAT qword with bit 63 set is an ordinal flag, not a guest token.
+
+  py -3 cfg_sandbox.py --exe "D:\Skyrim Anniversary Edition\SkyrimSE.exe" --expect-sha256 21A6F8244A57E880D02E600ADF61178AB5483DB7B3CCA8DBFC97D7CA1F081E18 --iat-discover --report "%USERPROFILE%\skyrimse-iat-discover.json"
+
 Exit code 3 means the SHA-256 did not match and nothing was scanned.

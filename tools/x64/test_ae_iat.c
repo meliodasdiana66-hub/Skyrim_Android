@@ -179,7 +179,10 @@ int main(int argc, char **argv) {
     expect(strcmp(report.reason, "store rolled back") == 0, "rollback is named");
     expect(read_qword(image->mem, 0x20A0) == 0x1111111111111111ULL, "first slot restored");
     expect(read_qword(image->mem, 0x20B0) == 0x1111111111111111ULL, "failed slot untouched");
+    expect(image->imports[0].resolved == 0 && image->imports[2].resolved == 0, "rollback does not mark a slot resolved");
     expect(image->imports_bound == 0 && image->entry_called == 0, "rolled back image is unbound");
+    expect(ae_token_decode(0x8000000000000007ULL, NULL, NULL) == 0, "an ordinal flag is not a token");
+    expect(ae_token_decode(0x8000000000000000ULL, NULL, NULL) == 0, "the high bit alone is not a token");
     expect(ae_bind_iat(image, registry, &report) == AE_OK, "bind before seal");
     expect(report.modeled == 3 && report.traps == 1 && report.slots == 4, "three calls and one trap");
     expect(image->imports[0].resolved == 1 && image->imports[3].resolved == 0, "a trap is not a resolved success");

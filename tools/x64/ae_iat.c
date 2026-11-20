@@ -156,8 +156,9 @@ int ae_bind_iat(PeImage *image, const AeRegistry *registry, AeBindReport *report
             fail_report(report, "store rolled back");
             return AE_ERR_BIND;
         }
-        image->imports[i].resolved = registry->items[i].modeled ? 1 : 0;
     }
+    for (i = 0; i < registry->count; i++)
+        image->imports[i].resolved = registry->items[i].modeled ? 1 : 0;
     free(saved);
     image->imports_bound = 1;
     image->entry_called = 0;

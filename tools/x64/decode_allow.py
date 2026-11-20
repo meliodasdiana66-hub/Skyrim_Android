@@ -101,7 +101,7 @@ def _one(code, start, addr, control=False):
         return 32
 
     def finish(mnemonic, cursor, reads, writes, rip=None, mem=None, stack=None, imm=None,
-               lea_target=None, lea_disp=None, xmm=None, branch=None):
+               lea_target=None, lea_disp=None, xmm=None, branch=None, iat=None):
         size = cursor - start
         insn = {
             "mnemonic": mnemonic,
@@ -123,6 +123,8 @@ def _one(code, start, addr, control=False):
             insn["target"] = branch
         if lea_disp is not None:
             insn["leaDisp"] = lea_disp
+        if iat is not None:
+            insn["iat"] = iat
         if xmm is not None:
             insn["xmm"] = xmm
         return insn, size
@@ -164,7 +166,9 @@ def _one(code, start, addr, control=False):
     if op == 0xFF:
         if not control:
             raise Reject("unsupported")
-        ext, _kind, _cursor = _modrm(code, index + 1, addr, start, rex_r, rex_b, rex_x)
+        ext, kind, cursor = _modrm(code, index + 1, addr, start, rex_r, rex_b, rex_x)
+        if ext == 2 and kind[0] == "rip":
+            return finish("call_rip", cursor, [], [], iat=kind[1])
         raise Reject("indirect_call" if ext == 2 else "indirect_branch")
     if 0x50 <= op <= 0x5F:
         if opsize16:

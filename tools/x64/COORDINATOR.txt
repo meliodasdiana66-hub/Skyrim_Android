@@ -51,4 +51,8 @@ Run 12 verified the official data map on the real EXE at the preferred base and 
 
 A synthetic instruction list can call through one of those slots. It checks 16-byte alignment and the 32-byte shadow, then dispatches only a registered token. An illegal target, a trap token, a step budget, or a depth budget is a named failure and does not invent a success. The comparison is the virtual shim, not Unicorn and not a Windows DLL. The image entry point is not fetched. The RCX graph contract was not changed.
 
-Still unsupported at game scale: executing the other 597 imports, the blocked 38+52 graph, backward branches, indexed LEA, LOCK, segment overrides, D3D11/DXGI, TLS, exceptions, audio, BSA/ESM, and any ARM64 Android run. No APK.
+Run 13 bound both bases: 599 unique RVAs and tokens, 2 modeled, 597 traps, rollback and a second bind and the seal all held, and the file hash did not change. Twenty-eight unbound qwords have bit 63 set. They are ordinal flags. token_decode rejects them because the kind and id do not rebuild the qword. A high bit alone is not a token.
+
+call [rip+disp32] is the only new indirect form. The effective address must be a registered IAT slot. The lifter uses the same return-address push as a direct call, then the virtual API. Errors restore nothing they did not push, and they leave RAX alone. A synthetic PE walks load, bind, decode, lift, and return. Unicorn's reference is a stub at the token address, compared on success only. --iat-discover is read-only and does not run a graph or the entry point. The RCX graph was not given a contract.
+
+Still unsupported at game scale: executing the other 597 imports, translating a real routine that passed --iat-discover (that count may be zero), the blocked 38+52 graph, backward branches, indexed LEA, LOCK, segment overrides, D3D11/DXGI, TLS, exceptions, audio, BSA/ESM, and any ARM64 Android run. No APK.

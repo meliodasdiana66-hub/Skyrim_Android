@@ -59,7 +59,22 @@ class CfgError(Exception):
         self.detail = detail or {}
 
 
-def _decode(code, base):
+def guest_token(kind, thunk_id):
+    """Same bits as ae_guest_token. The high bit alone is not enough."""
+    return 0x8000000000000000 | ((kind & 0xF) << 36) | ((thunk_id & 0x0FFFFFFF) << 4)
+
+
+def token_decode(token):
+    kind = (token >> 36) & 0xF
+    thunk_id = (token >> 4) & 0x0FFFFFFF
+    if token != guest_token(kind, thunk_id):
+        return None
+    if kind not in (1, 2):
+        return None
+    return kind, thunk_id
+
+
+def _decode(code, base, allow_iat=False):
     if len(code) > MAX_INSNS * 8:
         raise CfgError("step_budget")
     try:
@@ -70,6 +85,8 @@ def _decode(code, base):
         raise CfgError("step_budget")
     if not insns or insns[-1]["mnemonic"] != "ret":
         raise CfgError("missing_ret")
+    if not allow_iat and any(insn["mnemonic"] == "call_rip" for insn in insns):
+        raise CfgError("indirect_call")
     return insns
 
 
@@ -106,7 +123,16 @@ def _acyclic(graph):
             walk(node)
 
 
-def prepare(funcs, entry, imports=None, max_steps=MAX_STEPS_DEFAULT):
+def _check_iat_addr(addr, slots):
+    if addr not in slots:
+        raise CfgError("unknown_iat")
+    if addr < 0 or addr + 8 > MEMSZ:
+        raise CfgError("iat_oob")
+    if addr & 7 or (addr >> 12) != ((addr + 7) >> 12):
+        raise CfgError("iat_cross_page")
+
+
+def prepare(funcs, entry, imports=None, max_steps=MAX_STEPS_DEFAULT, iat_slots=None):
     """Validate an explicit function map. Does not execute it."""
     if not funcs or entry not in funcs:
         raise CfgError("unknown_target")
@@ -117,7 +143,10 @@ def prepare(funcs, entry, imports=None, max_steps=MAX_STEPS_DEFAULT):
     graph = {}
     logical = 0
     for base, code in funcs.items():
-        insns = _decode(code, base)
+        insns = _decode(code, base, allow_iat=iat_slots is not None)
+        for insn in insns:
+            if insn["mnemonic"] == "call_rip":
+                _check_iat_addr(insn["iat"], iat_slots)
         calls = _edges(insns, base, len(code))
         for target in calls:
             if target in imports:
@@ -148,7 +177,7 @@ def _leaders(insns, base):
         if insn["mnemonic"] in JCC or insn["mnemonic"] == "jmp":
             leaders.add(insn["target"])
             leaders.add(nxt)
-        elif insn["mnemonic"] == "call":
+        elif insn["mnemonic"] in ("call", "call_rip"):
             leaders.add(nxt)
     return leaders
 
@@ -165,7 +194,7 @@ def _blocks(code, base, insns):
             current = None
         if current is None:
             current = insn["address"]
-        if insn["mnemonic"] in JCC or insn["mnemonic"] in ("jmp", "call", "ret"):
+        if insn["mnemonic"] in JCC or insn["mnemonic"] in ("jmp", "call", "call_rip", "ret"):
             blocks.append((current, straight, insn))
             straight = []
             current = None
@@ -187,7 +216,7 @@ def _c_name(addr):
     return "guest_%x" % addr
 
 
-def _emit_function(base, code, insns, max_steps, max_depth):
+def _emit_function(base, code, insns, max_steps, max_depth, iat_slots=None, last_addr=0, pid=0):
     blocks = _blocks(code, base, insns)
     ids = {start: index for index, (start, _raw, _count, _term) in enumerate(blocks)}
     lines = ["void %s(Cpu64 *c, uint8_t *mem) {" % _c_name(base),
@@ -227,6 +256,15 @@ def _emit_function(base, code, insns, max_steps, max_depth):
             lines.append("            if (stop) return;")
             lines.append("            depth--;")
             lines.append("            block = %d; continue;" % ids[nxt])
+        elif term["mnemonic"] == "call_rip":
+            nxt = term["address"] + term["size"]
+            slot = iat_slots[term["iat"]]
+            api = {"GetLastError": 1, "GetCurrentProcessId": 2, "SetLastError": 3}.get(slot["name"], 0)
+            if not slot.get("modeled", True):
+                api = 0
+            lines.append("            if (ae_iat_call(c, mem, %#xull, %uu, %d, %d, %d, %#xull, %#xull, %#xull) != 0) return;" % (
+                term["iat"], slot["id"], api, max_depth, max_steps, nxt, last_addr, pid))
+            lines.append("            block = %d; continue;" % ids[nxt])
         else:
             raise CfgError("unsupported")
         lines.append("        }")
@@ -241,11 +279,46 @@ def _emit_function(base, code, insns, max_steps, max_depth):
     return "\n".join(helpers + lines)
 
 
+def _iat_helper(last_addr, pid):
+    return """
+static int ae_iat_call(Cpu64 *c, uint8_t *mem, uint64_t slot, unsigned expect_id, int api,
+                       int max_depth, int max_steps, uint64_t ret_ip, uint64_t last_addr, uint64_t pid) {
+    uint64_t rsp = rd(c, 4, 64);
+    uint64_t token, kind, id, rebuilt;
+    if ((rsp & 15ull) != 0ull) { stop = 12; return 12; }
+    if (rsp < %dull || rsp + 0x20ull > %dull) { stop = 14; return 14; }
+    if ((slot & 7ull) || ((slot >> 12) != ((slot + 7ull) >> 12)) || slot + 8ull > (uint64_t)MEMSZ) {
+        stop = 16; return 16;
+    }
+    if (++depth > max_depth) { stop = 11; return 11; }
+    if (++steps > max_steps) { depth--; stop = 9; return 9; }
+    token = ld(mem, slot, 8);
+    kind = (token >> 36) & 0xfull;
+    id = (token >> 4) & 0x0fffffffull;
+    rebuilt = 0x8000000000000000ull | (kind << 36) | (id << 4);
+    if (token != rebuilt || (kind != 1ull && kind != 2ull) || id != expect_id) {
+        depth--; stop = 15; return 15;
+    }
+    if (kind == 2ull || api == 0) { depth--; stop = 13; return 13; }
+    wr(c, 4, rsp - 8ull, 64);
+    st(mem, rsp - 8ull, ret_ip, 8);
+    if (api == 1) wr(c, 0, ld(mem, last_addr, 4), 64);
+    else if (api == 2) wr(c, 0, pid, 64);
+    else if (api == 3) st(mem, last_addr, rd(c, 1, 32), 4);
+    else { wr(c, 4, rsp, 64); depth--; stop = 13; return 13; }
+    if (ld(mem, rd(c, 4, 64), 8) != ret_ip) { wr(c, 4, rsp, 64); depth--; stop = 18; return 18; }
+    wr(c, 4, rd(c, 4, 64) + 8ull, 64);
+    depth--;
+    return 0;
+}
+""" % (STACK_LO + 8, STACK_TOP)
+
+
 def emit_program(funcs, entry, imports=None, max_steps=MAX_STEPS_DEFAULT, max_depth=MAX_DEPTH_DEFAULT,
-                  freestanding=False):
-    prepared = prepare(funcs, entry, imports=imports, max_steps=max_steps)
+                  freestanding=False, iat_slots=None, last_addr=0, pid=0, report_stop=False):
+    prepared = prepare(funcs, entry, imports=imports, max_steps=max_steps, iat_slots=iat_slots)
     uses_depth = any(
-        insn["mnemonic"] == "call"
+        insn["mnemonic"] in ("call", "call_rip")
         for base in prepared["reachable"]
         for insn in prepared["insns"][base]
     )
@@ -259,10 +332,14 @@ def emit_program(funcs, entry, imports=None, max_steps=MAX_STEPS_DEFAULT, max_de
     if uses_depth:
         parts.append("static int depth;")
     parts.append("static int stop;")
+    if iat_slots is not None:
+        parts.append(_iat_helper(last_addr, pid))
     for base in prepared["reachable"]:
         parts.append("void %s(Cpu64 *c, uint8_t *mem);" % _c_name(base))
     for base in prepared["reachable"]:
-        parts.append(_emit_function(base, funcs[base], prepared["insns"][base], max_steps, max_depth))
+        parts.append(_emit_function(
+            base, funcs[base], prepared["insns"][base], max_steps, max_depth,
+            iat_slots=iat_slots, last_addr=last_addr, pid=pid))
     if not freestanding:
         parts.append("int main(void) {")
         parts.append("#ifdef _WIN32")
@@ -277,7 +354,12 @@ def emit_program(funcs, entry, imports=None, max_steps=MAX_STEPS_DEFAULT, max_de
             reset = "    steps = 0; depth = 0; stop = 0;"
         parts.append(reset)
         parts.append("    %s(&c, mem);" % _c_name(entry))
-        parts.append("    if (stop) return stop;")
+        if report_stop:
+            parts.append("    if (fwrite(&c, sizeof c, 1, stdout) != 1) return 4;")
+            parts.append("    if (fwrite(mem, 1, MEMSZ, stdout) != MEMSZ) return 5;")
+            parts.append("    return stop;")
+        else:
+            parts.append("    if (stop) return stop;")
         parts.append("    if (fwrite(&c, sizeof c, 1, stdout) != 1) return 4;")
         parts.append("    if (fwrite(mem, 1, MEMSZ, stdout) != MEMSZ) return 5;")
         parts.append("    return 0;")
@@ -380,6 +462,119 @@ def execute(funcs, entry, cpu, mem, return_ip, imports=None, max_steps=MAX_STEPS
         "depthBudget": max_depth,
         "result": "match",
         "stopping": "returned_to_harness",
+    }
+
+
+_IAT_STOP = {
+    9: "step_budget", 11: "depth_budget", 12: "misaligned_stack", 13: "unimplemented_import",
+    14: "shadow_space", 15: "illegal_token", 16: "iat_oob", 18: "return_mismatch",
+}
+_MODELED_APIS = frozenset({"GetLastError", "GetCurrentProcessId", "SetLastError"})
+
+
+def virtual_api(name, ecx, last, pid, rax):
+    """Defined virtual result. Not Unicorn and not a Windows DLL."""
+    if name == "SetLastError":
+        return rax, ecx & 0xFFFFFFFF
+    if name == "GetLastError":
+        return last & 0xFFFFFFFF, last
+    if name == "GetCurrentProcessId":
+        return pid & 0xFFFFFFFF, last
+    return None
+
+
+def execute_iat(funcs, entry, cpu, mem, return_ip, iat_slots, last_addr, pid,
+                max_steps=MAX_STEPS_DEFAULT, max_depth=MAX_DEPTH_DEFAULT, probe=None):
+    """Lift call [rip+disp32] through a registered guest token.
+
+    Unicorn cannot interpret a token. For a successful call it fetches a
+    reference stub planted at that guest address. The lifter never reads
+    those stub bytes. Failures are decided by the lifter before the push, so
+    they are not compared with Unicorn.
+    """
+    _check_stack(cpu, mem, return_ip)
+    image = bytearray(mem)
+    for base, code in funcs.items():
+        if base < 0 or base + len(code) > MEMSZ or (STACK_LO <= base < STACK_TOP + 8):
+            raise CfgError("code_window")
+        image[base:base + len(code)] = code
+    source, prepared = emit_program(
+        funcs, entry, iat_slots=iat_slots, max_steps=max_steps, max_depth=max_depth,
+        last_addr=last_addr, pid=pid, report_stop=True)
+    td = Path(tempfile.mkdtemp(prefix="x64iat-"))
+    src = td / "cfg.c"
+    exe = td / "cfg"
+    src.write_text(source)
+    cmd = [os.environ.get("CC", "clang"), "-std=c11", "-O2", "-fwrapv", "-fno-strict-aliasing",
+           "-Wall", "-Wextra", "-Werror", "-I", str(HERE), str(src), "-o", str(exe)]
+    built = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if built.returncode != 0:
+        raise RuntimeError(built.stderr + "\n" + source)
+    host = subprocess.run([str(exe)], input=difftest64.pack_cpu(cpu) + bytes(image),
+                          capture_output=True, check=False, timeout=2)
+    if len(host.stdout) != difftest64.CPU_BYTES + MEMSZ:
+        raise CfgError("host_abort")
+    host_cpu = difftest64.unpack_cpu(host.stdout)
+    host_mem = host.stdout[difftest64.CPU_BYTES:]
+    if host.returncode != 0:
+        reason = _IAT_STOP.get(host.returncode, "host_abort")
+        rsp = host_cpu["r"][4]
+        below = int.from_bytes(host_mem[rsp - 8:rsp], "little") if rsp >= 8 else None
+        raise CfgError(reason, {
+            "rax": host_cpu["r"][0],
+            "rbx": host_cpu["r"][3],
+            "rsp": rsp,
+            "rcx": host_cpu["r"][1],
+            "below": below,
+        })
+    uc = Uc(UC_ARCH_X86, UC_MODE_64)
+    uc.mem_map(0, MEMSZ)
+    uc.mem_write(0, bytes(image))
+    # Unicorn fetches the token as a guest address. The bytes there are a
+    # reference stub, not the lifter's path and not a host function.
+    mapped_pages = set()
+    for slot in iat_slots.values():
+        if not slot.get("modeled") or slot["name"] not in _MODELED_APIS:
+            continue
+        token = guest_token(1, slot["id"])
+        page = token & ~0xFFF
+        if page not in mapped_pages:
+            uc.mem_map(page, 0x1000)
+            mapped_pages.add(page)
+        if slot["name"] == "GetLastError":
+            stub = b"\x48\xa1" + struct.pack("<Q", last_addr) + b"\xc3"
+        elif slot["name"] == "GetCurrentProcessId":
+            stub = b"\xb8" + struct.pack("<I", pid & 0xFFFFFFFF) + b"\xc3"
+        else:
+            stub = b"\x89\x0c\x25" + struct.pack("<I", last_addr) + b"\xc3"
+        uc.mem_write(token, stub)
+    for reg, value in zip(UC_GPRS, cpu["r"]):
+        uc.reg_write(reg, int(value) & 0xFFFFFFFFFFFFFFFF)
+    uc.reg_write(UC_X86_REG_EFLAGS, difftest64._flags_to_eflags(cpu))
+    try:
+        uc.emu_start(entry, return_ip, timeout=2000000)
+    except UcError as exc:
+        raise CfgError("unicorn_abort") from exc
+    uni = [uc.reg_read(reg) for reg in UC_GPRS]
+    names = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+             "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
+    diffs = [name for index, name in enumerate(names) if host_cpu["r"][index] != uni[index]]
+    uni_mem = bytes(uc.mem_read(0, MEMSZ))
+    if host_mem != uni_mem:
+        diffs.append("mem")
+    if diffs:
+        raise AssertionError("cfg mismatch: " + ",".join(diffs))
+    return {
+        "executed": True,
+        "rax": host_cpu["r"][0],
+        "rbx": host_cpu["r"][3],
+        "rsp": host_cpu["r"][4],
+        "lastError": int.from_bytes(host_mem[last_addr:last_addr + 4], "little"),
+        "entryPointExecuted": False,
+        "oracle": "unicorn-stub-at-token-address",
+        "reached": prepared["reachable"],
+        "slots": {addr: int.from_bytes(host_mem[addr:addr + 8], "little") for addr in iat_slots},
+        "probe": None if probe is None else int.from_bytes(host_mem[probe:probe + 8], "little"),
     }
 
 
@@ -1173,6 +1368,173 @@ def _analyze(data):
     return report, graphs, info
 
 
+def _slot_name(data, sections, thunk):
+    if thunk & 0x8000000000000000:
+        return None
+    try:
+        off = inspect_pe32plus.file_offset_for_rva(sections, (thunk & 0xFFFFFFFF) + 2, 1)
+    except inspect_pe32plus.PeFormatError:
+        return None
+    chars = []
+    for i in range(256):
+        try:
+            at = inspect_pe32plus.file_offset_for_rva(sections, (thunk & 0xFFFFFFFF) + 2 + i, 1)
+        except inspect_pe32plus.PeFormatError:
+            return None
+        byte = data[at]
+        if byte == 0:
+            try:
+                return bytes(chars).decode("ascii")
+            except UnicodeDecodeError:
+                return None
+        if byte < 0x20 or byte > 0x7E:
+            return None
+        chars.append(byte)
+    return None
+
+
+def _import_slots(data, info):
+    slots = {}
+    e_lfanew = inspect_pe32plus.u32(data, 0x3C)
+    opt = e_lfanew + 24
+    if inspect_pe32plus.u32(data, opt + 108) < 2:
+        return slots
+    rva = inspect_pe32plus.u32(data, opt + 120)
+    size = inspect_pe32plus.u32(data, opt + 124)
+    if rva == 0 or size < 20:
+        return slots
+    sections = info["sections"]
+    index = 0
+    while index < 64 and index * 20 + 20 <= size:
+        try:
+            off = inspect_pe32plus.file_offset_for_rva(sections, rva + index * 20, 20)
+        except inspect_pe32plus.PeFormatError:
+            break
+        oft, _tds, _fwd, name_rva, first = struct.unpack_from("<IIIII", data, off)
+        if oft == 0 and name_rva == 0 and first == 0:
+            break
+        raw = []
+        for i in range(64):
+            try:
+                at = inspect_pe32plus.file_offset_for_rva(sections, name_rva + i, 1)
+            except inspect_pe32plus.PeFormatError:
+                break
+            if data[at] == 0:
+                break
+            raw.append(data[at])
+        dll = bytes(raw).decode("ascii", "replace")
+        thunk_rva = oft or first
+        iat_rva = first or oft
+        step = 0
+        while step < 4096:
+            try:
+                toff = inspect_pe32plus.file_offset_for_rva(sections, thunk_rva + step * 8, 8)
+            except inspect_pe32plus.PeFormatError:
+                break
+            value = struct.unpack_from("<Q", data, toff)[0]
+            if value == 0:
+                break
+            ordinal = bool(value & 0x8000000000000000)
+            name = None if ordinal else _slot_name(data, sections, value)
+            modeled = (not ordinal and dll.lower() == "kernel32.dll" and
+                       name in ("GetLastError", "GetCurrentProcessId"))
+            slots[iat_rva + step * 8] = {"dll": dll, "name": name, "ordinal": ordinal, "modeled": modeled}
+            step += 1
+        index += 1
+    return slots
+
+
+def discover_modeled_iat(data):
+    """Count small routines whose only calls are modeled IAT slots. Executes nothing."""
+    info = inspect_pe32plus.inspect_bytes(data)
+    slots = _import_slots(data, info)
+    report = {
+        "tool": "iat-discover",
+        "executed": False,
+        "entryPointExecuted": False,
+        "scanned": 0,
+        "withRipCall": 0,
+        "eligible": 0,
+        "eligibleEntries": [],
+        "obstacles": {},
+        "modeledSlots": sum(1 for slot in slots.values() if slot["modeled"]),
+        "ordinalSlots": sum(1 for slot in slots.values() if slot["ordinal"]),
+    }
+    exc = info["exceptionDirectory"]
+    if not exc["present"] or exc["size"] < 12:
+        report["obstacles"] = {"no_exception_directory": 1}
+        return report
+    try:
+        off = inspect_pe32plus.file_offset_for_rva(info["sections"], exc["virtualAddress"], exc["size"])
+    except inspect_pe32plus.PeFormatError:
+        report["obstacles"] = {"unmapped_pdata": 1}
+        return report
+    blob = data[off:off + exc["size"]]
+    executable = []
+    for sec in info["sections"]:
+        if sec["name"] == ".bind" or not sec["executable"]:
+            continue
+        lo = sec["virtualAddress"]
+        executable.append((lo, lo + max(sec["virtualSize"], 1)))
+    obstacles = Counter()
+    for n in range(len(blob) // 12):
+        begin = int.from_bytes(blob[n * 12:n * 12 + 4], "little")
+        end = int.from_bytes(blob[n * 12 + 4:n * 12 + 8], "little")
+        if end <= begin or end - begin > MAX_INSNS * 8:
+            continue
+        if not any(lo <= begin and end <= hi for lo, hi in executable):
+            continue
+        if begin == info.get("addressOfEntryPoint"):
+            continue
+        report["scanned"] += 1
+        try:
+            raw_at = inspect_pe32plus.file_offset_for_rva(info["sections"], begin, end - begin)
+            code = bytes(data[raw_at:raw_at + (end - begin)])
+            insns = decode_allow.decode_stream(code, begin, control=True)
+        except (inspect_pe32plus.PeFormatError, decode_allow.Reject):
+            continue
+        if not any(insn["mnemonic"] == "call_rip" for insn in insns):
+            continue
+        report["withRipCall"] += 1
+        reason = None
+        for insn in insns:
+            if insn["mnemonic"] == "call_rip":
+                addr = insn["iat"]
+                if addr < 0 or addr + 8 > MEMSZ or addr & 7 or (addr >> 12) != ((addr + 7) >> 12):
+                    reason = "iat_cross_page"
+                    break
+                slot = slots.get(addr)
+                if slot is None:
+                    reason = "unknown_iat"
+                    break
+                if not slot["modeled"]:
+                    reason = "iat_unmodeled"
+                    break
+            elif insn["mnemonic"] == "call":
+                reason = "direct_call"
+                break
+            elif insn["mnemonic"] not in ("mov", "sub", "add", "ret") or insn.get("mem") or insn.get("rip"):
+                reason = "memory_or_global"
+                break
+            elif insn["mnemonic"] in ("sub", "add") and not any(index == 4 for index, _bits in insn["writes"]):
+                reason = "memory_or_global"
+                break
+        if reason is None and (not insns or insns[-1]["mnemonic"] != "ret"):
+            reason = "missing_ret"
+        if reason is None:
+            report["eligible"] += 1
+            report["eligibleEntries"].append(begin)
+        else:
+            obstacles[reason] += 1
+    report["obstacles"] = dict(obstacles)
+    report["note"] = (
+        "Read-only. No graph was executed and the entry point was not called. "
+        "eligibleEntries are RVAs of routines whose only calls are "
+        "KERNEL32 GetLastError or GetCurrentProcessId. Counts do not include instruction bytes."
+    )
+    return report
+
+
 def discover_closed(data, max_graphs=8):
     """Read-only search for closed direct-call graphs.
 
@@ -1193,6 +1555,8 @@ def main(argv=None):
                         help="run closed graphs that pass the safety contract; does not call the PE entry")
     parser.add_argument("--diagnose", action="store_true",
                         help="metadata-only rejection report; does not execute any graph")
+    parser.add_argument("--iat-discover", action="store_true",
+                        help="count routines that only call modeled IAT slots; does not execute")
     parser.add_argument("--max-graphs", type=int, default=8)
     parser.add_argument("--max-functions", type=int, default=8)
     parser.add_argument("--max-instructions", type=int, default=64)
@@ -1211,11 +1575,13 @@ def main(argv=None):
     if digest.lower() != args.expect_sha256.lower():
         print("sha256 mismatch", file=sys.stderr)
         return 3
-    if args.execute and args.diagnose:
-        print("choose only one of --execute and --diagnose", file=sys.stderr)
+    if sum(bool(flag) for flag in (args.execute, args.diagnose, args.iat_discover)) > 1:
+        print("choose only one of --execute, --diagnose, and --iat-discover", file=sys.stderr)
         return 2
     try:
-        if args.diagnose:
+        if args.iat_discover:
+            report = discover_modeled_iat(data)
+        elif args.diagnose:
             report = diagnose_image(
                 data, max_graphs=args.max_graphs, max_functions=args.max_functions,
                 max_instructions=args.max_instructions,
@@ -1231,7 +1597,9 @@ def main(argv=None):
         print("pe: %s" % exc, file=sys.stderr)
         return 2
     report["sha256"] = digest
-    if args.diagnose:
+    if args.iat_discover:
+        pass
+    elif args.diagnose:
         report["note"] = (
             "Diagnostic only. No graph was executed. argument_contract_missing does not "
             "supply an object size; the observed access width is not a layout."
